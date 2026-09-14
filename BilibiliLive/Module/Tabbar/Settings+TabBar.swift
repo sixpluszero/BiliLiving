@@ -59,7 +59,7 @@ extension Settings {
     }
 
     static var defaultPlacements: [TabBarPagePlacement] {
-        TabBarPage.allConfigurablePages.map { page in
+        (TabBarPage.defaultTabBarPages + TabBarPage.allConfigurablePages.filter { !TabBarPage.defaultTabBarPages.contains($0) }).map { page in
             let section: TabBarPageSection = TabBarPage.defaultTabBarPages.contains(page) ? .tabBar : .personal
             return .init(page: page, section: page.isFixedInTabBar ? .tabBar : section)
         }

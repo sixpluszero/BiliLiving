@@ -19,7 +19,7 @@ enum FeedDisplayStyle: Codable, CaseIterable {
     }
 }
 
-class Defaults {
+class Defaults: ObservableObject {
     static let shared = Defaults()
     private init() {}
 
@@ -27,7 +27,7 @@ class Defaults {
 }
 
 enum Settings {
-    @UserDefaultCodable("Settings.displayStyle", defaultValue: .normal)
+    @UserDefaultCodable("Settings.displayStyle", defaultValue: .large)
     static var displayStyle: FeedDisplayStyle
 
     @UserDefault("Settings.direatlyEnterVideo", defaultValue: false)
@@ -39,7 +39,7 @@ enum Settings {
     @UserDefaultCodable("Settings.mediaPlayerSpeed", defaultValue: PlaySpeed.default)
     static var mediaPlayerSpeed: PlaySpeed
 
-    @UserDefaultCodable("Settings.danmuArea", defaultValue: .style_75)
+    @UserDefaultCodable("Settings.danmuArea", defaultValue: .style_50)
     static var danmuArea: DanmuArea
 
     @UserDefaultCodable("Settings.danmuSize", defaultValue: .size_36)
@@ -78,7 +78,7 @@ enum Settings {
     @UserDefault("DLNA.uuid", defaultValue: "")
     static var uuid: String
 
-    @UserDefault("DLNA.enable", defaultValue: true)
+    @UserDefault("DLNA.enable", defaultValue: false)
     static var enableDLNA: Bool
 
     @UserDefault("Settings.continouslyPlay", defaultValue: true)
@@ -359,7 +359,7 @@ extension MediaQualityEnum {
     var qn: Int {
         switch self {
         case .quality_1080p:
-            return 116
+            return 80
         case .quality_2160p:
             return 120
         case .quality_hdr_dolby:

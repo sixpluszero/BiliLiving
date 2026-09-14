@@ -24,6 +24,9 @@ class SearchResultViewController: UIViewController {
 
     @Published var searchText: String = ""
     var cancellable: Cancellable?
+    private var searchTask: Task<Void, Never>?
+    private let statusLabel = UILabel()
+    deinit { searchTask?.cancel() }
     private let suggestDelayWork = DelayWork(delay: 1.0, noDelayForFirstTask: true)
     private var showHistorySuggest = false
     private let hotSuggestLimit = 6
@@ -40,29 +43,46 @@ class SearchResultViewController: UIViewController {
             make.edges.equalToSuperview()
         }
         configureDataSource()
+        collectionView.backgroundColor = .clear
+        view.backgroundColor = UIColor(white: 0.035, alpha: 1)
+        statusLabel.font = .systemFont(ofSize: 27)
+        statusLabel.textColor = .secondaryLabel
+        statusLabel.numberOfLines = 0
+        statusLabel.textAlignment = .center
+        statusLabel.accessibilityIdentifier = "living.search.status"
+        statusLabel.text = "输入关键词，发现你想看的内容。\n也可以按住 Siri 遥控器麦克风键听写。"
+        collectionView.backgroundView = statusLabel
 
         cancellable = $searchText
-            .filter({ $0.count > 0 })
-            .debounce(for: 1.5, scheduler: RunLoop.main)
+            .debounce(for: 0.45, scheduler: RunLoop.main)
             .removeDuplicates()
             .sink { [weak self] key in
                 guard let self else { return }
-                Task { @MainActor in
-                    await self.performSearch(key: key)
+                self.searchTask?.cancel()
+                self.searchTask = Task { @MainActor [weak self] in
+                    await self?.performSearch(key: key.trimmingCharacters(in: .whitespacesAndNewlines))
                 }
             }
     }
 
     @MainActor
     private func performSearch(key: String) async {
-        // 使用 async let 并行请求
-        async let searchResultTask = WebRequest.requestSearchResult(key: key)
-        async let liveResultTask = WebRequest.requestSearchLiveResult(key: key)
-
-        let searchResult = try? await searchResultTask
-        let liveResult = try? await liveResultTask
-
-        updateSnapshot(searchResult: searchResult, liveResult: liveResult)
+        guard !key.isEmpty else {
+            updateSnapshot(searchResult: nil, liveResult: nil)
+            statusLabel.text = "输入关键词，发现你想看的内容。\n也可以按住 Siri 遥控器麦克风键听写。"
+            return
+        }
+        statusLabel.text = "正在搜索「\(key)」…"
+        do {
+            let result = try await WebRequest.requestSearchResult(key: key)
+            guard !Task.isCancelled, searchText.trimmingCharacters(in: .whitespacesAndNewlines) == key else { return }
+            updateSnapshot(searchResult: result, liveResult: nil)
+            statusLabel.text = currentSnapshot.numberOfItems == 0 ? "没有找到相关内容，换个关键词试试。" : nil
+        } catch {
+            guard !Task.isCancelled, searchText.trimmingCharacters(in: .whitespacesAndNewlines) == key else { return }
+            updateSnapshot(searchResult: nil, liveResult: nil)
+            statusLabel.text = "搜索暂时不可用，请检查网络后重新输入。"
+        }
     }
 
     @MainActor

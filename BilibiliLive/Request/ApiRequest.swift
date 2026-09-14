@@ -92,7 +92,7 @@ enum ApiRequest {
             switch response.result {
             case let .success(data):
                 let json = JSON(data)
-                print(json)
+                // Never log authentication payloads.
                 let errorCode = json["code"].intValue
                 if errorCode != 0 {
                     if errorCode == -101 {
@@ -153,7 +153,7 @@ enum ApiRequest {
         }
     }
 
-    static func requestLoginQR(handler: ((String, String) -> Void)? = nil) {
+    static func requestLoginQR(onFailure: ((RequestError) -> Void)? = nil, handler: ((String, String) -> Void)? = nil) {
         class Resp: Codable {
             let authCode: String
             let url: String
@@ -167,7 +167,7 @@ enum ApiRequest {
             case let .success(res):
                 handler?(res.authCode, res.url)
             case let .failure(error):
-                print(error)
+                onFailure?(error)
             }
         }
     }
@@ -215,19 +215,18 @@ enum ApiRequest {
             case var .success(res):
                 res.tokenInfo.expireDate = Date().addingTimeInterval(TimeInterval(res.tokenInfo.expiresIn))
                 let cookies = res.cookieInfo.toCookies()
-                CookieHandler.shared.saveCookie(list: cookies, syncWithAccount: false)
                 handler?(.success(token: res.tokenInfo, cookies: cookies))
             case let .failure(error):
                 switch error {
                 case let .statusFail(code, _):
                     switch code {
                     case 86038: handler?(.expire)
-                    case 86039: handler?(.waiting)
+                    case 86039, 86090: handler?(.waiting)
                     default:
-                        break
+                        handler?(.fail)
                     }
                 default:
-                    break
+                    handler?(.fail)
                 }
             }
         }

@@ -20,6 +20,8 @@ class CommonPlayerViewController: UIViewController {
     private var isRestoringFromPip = false
     /// 新 AVPlayerItem ready 后是否自动 play。换 CDN host 等场景可临时关掉，由调用方按用户暂停状态决定是否续播。
     var autoPlayWhenReady = true
+    // Keep suppression attached to the item: readiness KVO may arrive after a quality switch returns.
+    weak var manuallyManagedPlayerItem: AVPlayerItem?
     var showsPlaybackControls = true
     var allowsPictureInPicturePlayback = true
 
@@ -197,7 +199,7 @@ extension CommonPlayerViewController {
                 isEnd = false
                 activePlugins.forEach { $0.playerWillStart(player: player) }
                 playerWillStart(player: player)
-                if autoPlayWhenReady {
+                if autoPlayWhenReady && manuallyManagedPlayerItem !== item {
                     player.play()
                 }
             case .failed:

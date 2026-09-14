@@ -198,9 +198,10 @@ final class AccountManager {
     }
 
     private func loadFromStorage() {
-        if let data = storage.data(forKey: accountsKey) {
+        if let data = LivingCredentialStore.load() ?? storage.data(forKey: accountsKey) {
             do {
                 storedAccounts = try JSONDecoder().decode([Account].self, from: data)
+                if LivingCredentialStore.save(data) { storage.removeObject(forKey: accountsKey) }
             } catch {
                 storedAccounts = []
             }
@@ -219,7 +220,11 @@ final class AccountManager {
     private func persistAccounts() {
         let encoder = JSONEncoder()
         if let data = try? encoder.encode(storedAccounts) {
-            storage.set(data, forKey: accountsKey)
+            if LivingCredentialStore.save(data) {
+                storage.removeObject(forKey: accountsKey)
+            } else {
+                Logger.warn("Account session could not be persisted to Keychain")
+            }
         } else {
             storage.removeObject(forKey: accountsKey)
         }

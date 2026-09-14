@@ -1,0 +1,32 @@
+{
+  "assets" : [
+    {
+      "filename" : "Living Icon.imagestack",
+      "idiom" : "tv",
+      "role" : "primary-app-icon",
+      "size" : "400x240"
+    },
+    {
+      "filename" : "Living Store.imagestack",
+      "idiom" : "tv",
+      "role" : "primary-app-icon",
+      "size" : "1280x768"
+    },
+    {
+      "filename" : "Living Shelf.imageset",
+      "idiom" : "tv",
+      "role" : "top-shelf-image",
+      "size" : "1920x720"
+    },
+    {
+      "filename" : "Living Wide.imageset",
+      "idiom" : "tv",
+      "role" : "top-shelf-image-wide",
+      "size" : "2320x720"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}

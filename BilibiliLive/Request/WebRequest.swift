@@ -10,10 +10,17 @@ import Foundation
 import SwiftProtobuf
 import SwiftyJSON
 
-enum RequestError: Error {
+enum RequestError: LocalizedError {
     case networkFail
     case statusFail(code: Int, message: String)
     case decodeFail(message: String)
+    var errorDescription: String? {
+        switch self {
+        case .networkFail: return "网络连接失败，请检查网络后重试。"
+        case let .statusFail(code, message): return "\(message)（\(code)）"
+        case .decodeFail: return "暂时无法读取视频信息，请稍后重试。"
+        }
+    }
 }
 
 enum ValidationError: Error {
@@ -158,7 +165,7 @@ enum WebRequest {
                 }
                 let dataj = json[dataObj]
                 #if DEBUG
-                    print("\(url) response: \(json)")
+                    // Response bodies may contain session or personal data.
                 #endif
                 complete?(.success(dataj))
             case let .failure(err):
@@ -343,7 +350,14 @@ extension WebRequest {
     }
 
     static func requestDetailVideo(aid: Int) async throws -> VideoDetail {
-        try await request(url: "https://api.bilibili.com/x/web-interface/view/detail", parameters: ["aid": aid])
+        do {
+            return try await request(url: "https://api.bilibili.com/x/web-interface/view/detail", parameters: ["aid": aid])
+        } catch {
+            // The aggregate endpoint can fail while the video and playback are available.
+            let info: VideoDetail.Info = try await request(url: "https://api.bilibili.com/x/web-interface/wbi/view", parameters: ["aid": aid])
+            let related: [VideoDetail.Info] = (try? await request(url: "https://api.bilibili.com/x/web-interface/archive/related", parameters: ["aid": aid])) ?? []
+            return VideoDetail(View: info, Related: related, Card: .init(following: false, follower: nil))
+        }
     }
 
     static func requestFavVideosList() async throws -> [FavListData] {
@@ -671,7 +685,7 @@ extension WebRequest {
             (result: Result<[String: String], RequestError>) in
             if let details = try? result.get() {
                 print("logout success")
-                print(details)
+                // Do not log account details.
             } else {
                 print("logout fail")
             }

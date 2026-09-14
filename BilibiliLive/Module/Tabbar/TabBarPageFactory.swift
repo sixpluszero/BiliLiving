@@ -14,7 +14,7 @@ class TabBarPageVCFactory {
         case .live:
             vc = LiveViewController()
         case .feed:
-            vc = RecommendViewController()
+            vc = LivingHomeViewController()
         case .tvRecommend:
             let tvRecommendVC = TVRecommendBrowserViewController()
             tvRecommendVC.modalPresentationStyle = .fullScreen
@@ -28,13 +28,15 @@ class TabBarPageVCFactory {
         case .favorite:
             vc = FavoriteViewController()
         case .personal:
-            let personalVC = PersonalViewController.create()
+            let personalVC = LivingLibraryViewController()
             personalVC.extendedLayoutIncludesOpaqueBars = true
             vc = personalVC
         case .search:
             let resultVC = SearchResultViewController()
             let searchVC = UISearchController(searchResultsController: resultVC)
             searchVC.searchResultsUpdater = resultVC
+            searchVC.searchBar.placeholder = "搜索视频、UP 主或番剧"
+            searchVC.searchBar.accessibilityIdentifier = "living.search"
             vc = UISearchContainerViewController(searchController: searchVC)
         case .followBangumi:
             vc = FollowBangumiViewController()
@@ -51,7 +53,7 @@ class TabBarPageVCFactory {
         switch page {
         case .search:
             vc.tabBarItem.image = UIImage(systemName: "magnifyingglass")
-            vc.tabBarItem.title = nil
+            vc.tabBarItem.title = page.title
         default:
             vc.tabBarItem.title = page.title
         }

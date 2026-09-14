@@ -27,7 +27,7 @@ enum TabBarPage: String, CaseIterable, Codable {
         case .live:
             return "直播"
         case .feed:
-            return "推荐"
+            return "发现"
         case .tvRecommend:
             return "TV推荐"
         case .hot:
@@ -69,7 +69,7 @@ enum TabBarPage: String, CaseIterable, Codable {
     }
 
     static var defaultTabBarPages: [TabBarPage] {
-        [.live, .feed, .hot, .ranking, .follows, .favorite, .personal, .search]
+        [.feed, .search, .personal]
     }
 
     static var allConfigurablePages: [TabBarPage] {

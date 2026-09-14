@@ -312,8 +312,7 @@ class VideoDetailViewController: UIViewController {
                     updatePlayProgressIfNeeded(progress: info.user_status?.progress, episode: epi)
                 }
             }
-            if !isBangumi {
-                let playInfo = try await WebRequest.requestPlayerInfo(aid: aid, cid: cid == 0 ? data.View.cid : cid)
+            if !isBangumi, let playInfo = try? await WebRequest.requestPlayerInfo(aid: aid, cid: cid == 0 ? data.View.cid : cid) {
                 if cid == 0 {
                     cid = playInfo.last_play_cid > 0 ? playInfo.last_play_cid : data.View.cid
                 }
@@ -398,7 +397,8 @@ class VideoDetailViewController: UIViewController {
     private func update(with data: VideoDetail) {
         playCountLabel.text = data.View.stat.view.numberString()
         danmakuLabel.text = data.View.stat.danmaku.numberString()
-        followersLabel.text = (data.Card.follower ?? 0).numberString() + "粉丝"
+        followersLabel.text = data.Card.follower.map { $0.numberString() + "粉丝" }
+        followersLabel.isHidden = data.Card.follower == nil
         uploadTimeLabel.text = data.View.date
         bvidLabel.text = data.View.bvid
         coinButton.title = data.View.stat.coin.numberString()

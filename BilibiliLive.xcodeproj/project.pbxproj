@@ -5,6 +5,18 @@
 	};
 	objectVersion = 70;
 	objects = {
+BA0000000000000000000001 = { isa = PBXNativeTarget; buildConfigurationList = BA0000000000000000000002; buildPhases = (BA0000000000000000000005, BA0000000000000000000006, ); buildRules = (); dependencies = (BA000000000000000000000A, ); name = BiliLivingTests; productName = BiliLivingTests; productReference = BA0000000000000000000007; productType = "com.apple.product-type.bundle.unit-test"; };
+BA0000000000000000000002 = { isa = XCConfigurationList; buildConfigurations = (BA0000000000000000000003, BA0000000000000000000004, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
+BA0000000000000000000003 = { isa = XCBuildConfiguration; buildSettings = { BUNDLE_LOADER = "$(TEST_HOST)"; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = com.jialin.BiliLivingTests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = appletvos; SUPPORTED_PLATFORMS = "appletvos appletvsimulator"; TARGETED_DEVICE_FAMILY = 3; TVOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/BilibiliLive.app/BilibiliLive"; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@loader_path/Frameworks", ); }; name = Debug; };
+BA0000000000000000000004 = { isa = XCBuildConfiguration; buildSettings = { BUNDLE_LOADER = "$(TEST_HOST)"; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = com.jialin.BiliLivingTests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = appletvos; SUPPORTED_PLATFORMS = "appletvos appletvsimulator"; TARGETED_DEVICE_FAMILY = 3; TVOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/BilibiliLive.app/BilibiliLive"; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@loader_path/Frameworks", ); }; name = Release; };
+BA0000000000000000000005 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (BA0000000000000000000009, ); runOnlyForDeploymentPostprocessing = 0; };
+BA0000000000000000000006 = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+BA0000000000000000000007 = { isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = BiliLivingTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+BA0000000000000000000008 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Tests/BiliLivingTests.swift; sourceTree = SOURCE_ROOT; };
+BA0000000000000000000009 = { isa = PBXBuildFile; fileRef = BA0000000000000000000008; };
+BA000000000000000000000A = { isa = PBXTargetDependency; target = F9B5734F260F5F7400771ED5; targetProxy = BA000000000000000000000B; };
+BA000000000000000000000B = { isa = PBXContainerItemProxy; containerPortal = F9B57348260F5F7400771ED5; proxyType = 1; remoteGlobalIDString = F9B5734F260F5F7400771ED5; remoteInfo = BilibiliLive; };
+
 
 /* Begin PBXBuildFile section */
 		0A41EE192A630FEA0066444C /* SwiftProtobuf in Frameworks */ = {isa = PBXBuildFile; productRef = 0A41EE182A630FEA0066444C /* SwiftProtobuf */; };
@@ -85,6 +97,7 @@
 			isa = PBXGroup;
 			children = (
 				4930B8FD2D686DC30074E861 /* BilibiliLive */,
+ BA0000000000000000000008,
 				F9B57351260F5F7400771ED5 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -104,7 +117,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = F9B57362260F5F7600771ED5 /* Build configuration list for PBXNativeTarget "BilibiliLive" */;
 			buildPhases = (
-				4947421429050FAF005D6885 /* Swift formate */,
+
 				F9B5734C260F5F7400771ED5 /* Sources */,
 				F9B5734D260F5F7400771ED5 /* Frameworks */,
 				F9B5734E260F5F7400771ED5 /* Resources */,
@@ -183,6 +196,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
+ BA0000000000000000000001,
 				F9B5734F260F5F7400771ED5 /* BilibiliLive */,
 			);
 		};
@@ -352,11 +366,11 @@
 		F9B57363260F5F7600771ED5 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = "App Icon & Top Shelf Image";
+				ASSETCATALOG_COMPILER_APPICON_NAME = Living;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = MEWHFZ92DY;
+				DEVELOPMENT_TEAM = "";
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/BilibiliLive/Vendor",
@@ -371,7 +385,7 @@
 					"$(inherited)",
 					"$(PROJECT_DIR)/BilibiliLive/Vendor",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.etan.tv.BilibiliLive;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jialin.BiliLiving;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_VERSION = 5.0;
@@ -383,11 +397,11 @@
 		F9B57364260F5F7600771ED5 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = "App Icon & Top Shelf Image";
+				ASSETCATALOG_COMPILER_APPICON_NAME = Living;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = MEWHFZ92DY;
+				DEVELOPMENT_TEAM = "";
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/BilibiliLive/Vendor",
@@ -402,7 +416,7 @@
 					"$(inherited)",
 					"$(PROJECT_DIR)/BilibiliLive/Vendor",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.etan.tv.BilibiliLive;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jialin.BiliLiving;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 3;

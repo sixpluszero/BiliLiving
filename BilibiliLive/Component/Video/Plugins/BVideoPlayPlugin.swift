@@ -21,6 +21,7 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     private let mediaWarmupManager: PlayerMediaWarmupManager?
     private var currentQualityId: Int?
     private var currentPlaybackTime: Double = 0
+    private var hasAppliedStartPosition = false
     // 记录最近一次实际用于加载的 maxQuality/streamIndex，host 切换时原样复用，
     // 不去动用户当前的画质模式（自动多档 fallback 还是手动锁定某一档）
     private var lastMaxQuality: Int?
@@ -84,6 +85,8 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     }
 
     func playerWillStart(player: AVPlayer) {
+        guard !hasAppliedStartPosition else { return }
+        hasAppliedStartPosition = true
         if let playerStartPos = playData.playerStartPos {
             player.seek(to: CMTime(seconds: Double(playerStartPos), preferredTimescale: 1), toleranceBefore: .zero, toleranceAfter: .zero)
         }
@@ -492,12 +495,17 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     }
 
     @MainActor
-    func switchQuality(to qualityId: Int, streamIndex: Int?) async {
-        guard let player = playerVC?.player else { return }
+    func switchQuality(to qualityId: Int, streamIndex: Int?) async -> Bool {
+        guard let player = playerVC?.player else { return false }
 
         let currentTime = player.currentTime().seconds
-        guard currentTime > 0 else { return }
+        guard currentTime.isFinite && currentTime >= 0 else { return false }
 
+        let shouldResume = !isUserPaused
+        let previousRate = player.rate
+        let commonVC = playerVC?.parent as? CommonPlayerViewController
+        commonVC?.autoPlayWhenReady = false
+        defer { commonVC?.autoPlayWhenReady = true }
         // 保存当前播放位置
         currentPlaybackTime = currentTime
         currentQualityId = qualityId
@@ -508,7 +516,7 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
             try await playmedia(urlInfo: playData.videoPlayURLInfo,
                                 playerInfo: playData.playerInfo,
                                 generation: generation,
-                                maxQuality: qualityId,
+                                maxQuality: qualityId == 0 ? nil : qualityId,
                                 streamIndex: streamIndex,
                                 isQualitySwitch: true)
 
@@ -517,14 +525,17 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
                   !Task.isCancelled,
                   playerVC != nil,
                   let newPlayer = playerVC?.player
-            else { return }
+            else { return false }
             await newPlayer.seek(to: CMTime(seconds: currentPlaybackTime, preferredTimescale: 1), toleranceBefore: .zero, toleranceAfter: .zero)
-            guard loadGeneration == generation, !Task.isCancelled else { return }
-            newPlayer.play()
+            guard loadGeneration == generation, !Task.isCancelled else { return false }
+            if shouldResume { newPlayer.playImmediately(atRate: previousRate > 0 ? previousRate : 1) }
+            else { newPlayer.pause() }
+            return true
         } catch is CancellationError {
-            return
+            return false
         } catch {
             Logger.warn("[quality] Failed to switch quality: \(error)")
+            return false
         }
     }
 
@@ -541,6 +552,9 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
               let playerVC
         else { return }
         let playerItem = AVPlayerItem(asset: asset)
+        if let container = playerVC.parent as? CommonPlayerViewController, !container.autoPlayWhenReady {
+            container.manuallyManagedPlayerItem = playerItem
+        }
 
         // 设置 preferredPeakBitRate 为一个很高的值，让 AVPlayer 优先选择高码率流
         // 0 表示无限制，让 AVPlayer 根据网络条件自动选择最高可用码率

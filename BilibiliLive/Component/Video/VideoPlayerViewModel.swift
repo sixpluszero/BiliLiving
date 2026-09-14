@@ -341,9 +341,7 @@ class VideoPlayerViewModel {
 
         // 添加画质选择器插件
         let qualitySelector = BVideoQualityPlugin(detailData: data) { [weak playplugin] qualityId, streamIndex in
-            Task { @MainActor in
-                await playplugin?.switchQuality(to: qualityId, streamIndex: streamIndex)
-            }
+            await playplugin?.switchQuality(to: qualityId, streamIndex: streamIndex) ?? false
         }
 
         plugins.append(qualitySelector)
