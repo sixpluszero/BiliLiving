@@ -268,6 +268,7 @@ final class VideoPlayerActionInfoViewController: UIViewController {
     }
 
     private func handleFollow() {
+        guard requireLivingAccount() else { return }
         guard ownerMid > 0,
               let index = entries.firstIndex(where: { $0.kind == .follow })
         else { return }
@@ -278,6 +279,7 @@ final class VideoPlayerActionInfoViewController: UIViewController {
     }
 
     private func handleLike() {
+        guard requireLivingAccount() else { return }
         guard aid > 0,
               !inFlightKinds.contains(.like),
               let index = entries.firstIndex(where: { $0.kind == .like })
@@ -306,6 +308,7 @@ final class VideoPlayerActionInfoViewController: UIViewController {
     }
 
     private func handleFavorite() {
+        guard requireLivingAccount() else { return }
         guard aid > 0, !inFlightKinds.contains(.favorite) else { return }
         inFlightKinds.insert(.favorite)
 

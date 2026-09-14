@@ -211,7 +211,7 @@ final class LoginViewController: UIViewController {
         refresh.accessibilityIdentifier = "living.qr.refresh"
         stack.addArrangedSubview(refresh)
         let browse = UIButton(type: .system)
-        browse.setTitle("先逛逛", for: .normal)
+        browse.setTitle("游客浏览", for: .normal)
         browse.addAction(UIAction { _ in AppDelegate.shared.showTabBar() }, for: .primaryActionTriggered)
         browse.accessibilityIdentifier = "living.browse"
         stack.addArrangedSubview(browse)

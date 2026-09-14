@@ -123,8 +123,8 @@ struct LivingLibraryView: View {
             HStack(spacing: 28) {
                 Image(systemName: loggedIn ? "person.crop.circle.fill" : "person.crop.circle").font(.system(size: 80)).foregroundStyle(.white.opacity(0.75))
                 VStack(alignment: .leading, spacing: 12) {
-                    Text(loggedIn ? (AccountManager.shared.activeAccount?.profile.username ?? "我的空间") : "你的专属放映室").font(.system(size: 48, weight: .bold))
-                    Text(loggedIn ? "继续喜欢的内容，发现新的灵感。" : "扫码登录，同步收藏与观看记录。").font(.system(size: 25)).foregroundStyle(.secondary)
+                    Text(loggedIn ? (AccountManager.shared.activeAccount?.profile.username ?? "我的空间") : "游客模式").font(.system(size: 48, weight: .bold))
+                    Text(loggedIn ? "继续喜欢的内容，发现新的灵感。" : "无需登录，搜索、看视频和弹幕。登录后可同步收藏与观看记录。").font(.system(size: 25)).foregroundStyle(.secondary)
                 }
             }
             if !loggedIn {

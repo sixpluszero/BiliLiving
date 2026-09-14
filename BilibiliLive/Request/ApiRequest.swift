@@ -95,10 +95,10 @@ enum ApiRequest {
                 // Never log authentication payloads.
                 let errorCode = json["code"].intValue
                 if errorCode != 0 {
-                    if errorCode == -101 {
+                    if errorCode == -101, auth, AccountManager.shared.isLoggedIn {
                         AccountManager.shared.handleAuthenticationFailure()
                         if !AccountManager.shared.isLoggedIn {
-                            AppDelegate.shared.showLogin()
+                            AppDelegate.shared.showTabBar()
                         }
                     }
                     let message = json["message"].stringValue

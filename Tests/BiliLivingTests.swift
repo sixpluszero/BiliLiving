@@ -104,4 +104,18 @@ final class BiliLivingTests: XCTestCase {
         XCTAssertGreaterThan(nextPlayer.currentTime().seconds, position)
     }
 
+    @MainActor func testGuestLaunchAndAccountActionPrompt() async throws {
+        guard !ApiRequest.isLogin() else { throw XCTSkip("Guest test requires a logged-out simulator") }
+        let window = try XCTUnwrap(AppDelegate.shared.window)
+        let root = try XCTUnwrap(window.rootViewController)
+        XCTAssertTrue(root is BLTabBarViewController, "Guests must launch directly into browsing")
+        XCTAssertFalse(root.requireLivingAccount())
+        try await Task.sleep(nanoseconds: 500_000_000)
+        let prompt = try XCTUnwrap(root.presentedViewController as? UIAlertController)
+        XCTAssertEqual(prompt.title, "登录后使用")
+        XCTAssertTrue(prompt.actions.contains { $0.title == "继续游客浏览" && $0.style == .cancel })
+        XCTAssertTrue(prompt.actions.contains { $0.title == "扫码登录" })
+        root.dismiss(animated: false)
+    }
+
 }

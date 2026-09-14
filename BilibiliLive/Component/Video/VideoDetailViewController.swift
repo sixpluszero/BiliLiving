@@ -481,6 +481,7 @@ class VideoDetailViewController: UIViewController {
     }
 
     @IBAction func actionFollow(_ sender: Any) {
+        guard requireLivingAccount() else { return }
         followButton.isOn.toggle()
         if let mid = data?.View.owner.mid {
             WebRequest.follow(mid: mid, follow: followButton.isOn)
@@ -506,6 +507,7 @@ class VideoDetailViewController: UIViewController {
     }
 
     @IBAction func actionLike(_ sender: Any) {
+        guard requireLivingAccount() else { return }
         Task {
             if likeButton.isOn {
                 likeButton.title? -= 1
@@ -521,6 +523,7 @@ class VideoDetailViewController: UIViewController {
     }
 
     @IBAction func actionCoin(_ sender: Any) {
+        guard requireLivingAccount() else { return }
         guard didSentCoins < 2 else { return }
         let alert = UIAlertController(title: "投币个数", message: nil, preferredStyle: .actionSheet)
         WebRequest.requestTodayCoins { todayCoins in
@@ -555,6 +558,7 @@ class VideoDetailViewController: UIViewController {
     }
 
     @IBAction func actionFavorite(_ sender: Any) {
+        guard requireLivingAccount() else { return }
         Task {
             guard let favList = try? await WebRequest.requestFavVideosList() else {
                 return
@@ -580,6 +584,7 @@ class VideoDetailViewController: UIViewController {
     }
 
     @IBAction func actionDislike(_ sender: Any) {
+        guard requireLivingAccount() else { return }
         dislikeButton.isOn.toggle()
         ApiRequest.requestDislike(aid: aid, dislike: dislikeButton.isOn)
     }

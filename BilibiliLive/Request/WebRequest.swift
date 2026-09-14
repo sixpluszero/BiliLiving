@@ -398,6 +398,7 @@ extension WebRequest {
     }
 
     static func reportWatchHistory(aid: Int, cid: Int, currentTime: Int, epid: Int? = nil, seasonId: Int? = nil, subType: Int? = nil) {
+        guard ApiRequest.isLogin() else { return }
         var parameters: [String: Any] = [
             "aid": aid,
             "cid": cid,

@@ -33,10 +33,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
             } else {
                 ApiRequest.refreshToken()
             }
-            window?.rootViewController = BLTabBarViewController()
-        } else {
-            window?.rootViewController = LoginViewController.create()
         }
+        // Browsing is available without an account, including after relaunch.
+        window?.rootViewController = BLTabBarViewController()
         WebRequest.requestIndex()
         window?.makeKeyAndVisible()
         return true
