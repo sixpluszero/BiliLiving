@@ -39,6 +39,10 @@ enum PlayerMediaFactory {
                              maxQuality: maxQuality,
                              streamIndex: streamIndex,
                              preferredHost: preferredHost)
+        // Warmed/sequence playback also needs throughput selection; preparing
+        // only SIDX measures latency and used to bypass the normal CDN probe.
+        await delegate.selectPreferredCDNIfNeeded()
+        try Task.checkCancellation()
         asset.resourceLoader.setDelegate(delegate, queue: DispatchQueue(label: "loader.\(aid).\(UUID().uuidString)"))
         try Task.checkCancellation()
         let playable = try await asset.load(.isPlayable)

@@ -1,6 +1,14 @@
-<actionList>
-<action>
-<name>GetAppInfo</name>
-<argumentList></argumentList>
-</action>
-</actionList>
+<?xml version="1.0" encoding="UTF-8"?>
+<scpd xmlns="urn:schemas-upnp-org:service-1-0">
+  <specVersion>
+    <major>1</major>
+    <minor>0</minor>
+  </specVersion>
+  <actionList>
+    <action>
+      <name>GetAppInfo</name>
+      <argumentList></argumentList>
+    </action>
+  </actionList>
+  <serviceStateTable></serviceStateTable>
+</scpd>

@@ -41,11 +41,12 @@ class BUpnpPlugin: NSObject, CommonPlayerPlugin {
         observar = nil
         self.player = player
         if let seconds = context.pendingSeek { seek(to: seconds); context.pendingSeek = nil }
-        guard let duration else { return }
         observar = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 1, preferredTimescale: 1), queue: .global()) { time in
             guard time.seconds.isFinite else { return }
             DispatchQueue.main.async { [weak self] in
                 guard let self, BiliBiliUpnpDMR.shared.currentPlugin === self else { return }
+                let measured = self.player?.currentItem?.duration.seconds ?? 0
+                let duration = self.duration ?? (measured.isFinite && measured >= 0 && measured < Double(Int.max) ? Int(measured) : 0)
                 BiliBiliUpnpDMR.shared.sendProgress(duration: duration, current: Int(time.seconds))
             }
         }

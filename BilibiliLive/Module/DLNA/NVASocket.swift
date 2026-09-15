@@ -16,7 +16,9 @@ public func nvasocket(
     processor: ((NVASession, NVASession.NVAFrame) -> Void)? = nil
 ) -> ((HttpRequest) -> HttpResponse) {
     return { request in
-        guard request.method == "SETUP", let connectSession = request.headers["session"] else {
+        guard ["SETUP", "RESTORE"].contains(request.method),
+              let connectSession = request.headers["session"], !connectSession.isEmpty else {
+            Logger.warn("[cast] NVA handshake rejected: unsupported method or missing Session")
             return .badRequest(.text("No setup"))
         }
 
@@ -26,7 +28,7 @@ public func nvasocket(
                 while true {
                     let frame = try session.readFrame()
                     if frame.isPing {
-                        session.sendEmpty()
+                        session.sendEmpty(replyingTo: frame.number)
                     } else {
                         if frame.isCommand && frame.paramCount > 0 {
                             processor?(session, frame)
@@ -38,16 +40,18 @@ public func nvasocket(
             do {
                 try read()
             } catch let err {
-                Logger.warn("\(err)")
+                Logger.warn("[cast] NVA connection ended: \(err)")
             }
             didDisconnect?(session)
         }
+        Logger.info("[cast] NVA \(request.method) handshake accepted")
         let header = ["Session": connectSession,
                       "NvaVersion": "1",
+                      "Content-Length": "0",
                       "Connection": "Keep-Alive",
                       "UUID": uuid,
-                      "User-Agent": "Linux/3.0.0 UPnP/1.0 Platinum/1.0.5.13"]
-        return HttpResponse.rawProtocol(200, "OK", header, "NVA", protocolSessionClosure)
+                      "Server": "Linux/3.0.0 UPnP/1.0 Platinum/1.0.5.13"]
+        return HttpResponse.rawProtocol(200, "OK", header, "NVA/1.0", protocolSessionClosure)
     }
 }
 
@@ -56,20 +60,16 @@ public class NVASession: Hashable, Equatable {
         lhs.socket == rhs.socket
     }
 
-    var timer: Timer?
+    private var heartbeat: DispatchSourceTimer?
 
     private let versionLock = NSLock()
-    private var version: UInt32 = 1
+    private var version: UInt32 = 0
     private func nextVersion() -> UInt32 {
         versionLock.lock(); defer { versionLock.unlock() }
         version &+= 1
         return version
     }
-    private func receivedVersion(_ value: UInt32) {
-        versionLock.lock(); defer { versionLock.unlock() }
-        version = value
-    }
-    func close() { socket.close() }
+    func close() { heartbeat?.cancel(); socket.close() }
     enum FrameError: Error { case malformed, oversized }
     private func text(length: Int) throws -> String {
         guard let value = String(bytes: try socket.read(length: length), encoding: .utf8) else { throw FrameError.malformed }
@@ -105,7 +105,7 @@ public class NVASession: Hashable, Equatable {
         guard [0xe0, 0xc0, 0xe4].contains(fst), frame.paramCount <= 3 else { throw FrameError.malformed }
         let version = try uint32()
         frame.version = Int(version)
-        receivedVersion(version)
+        frame.number = version
 
         if frame.paramCount == 0 {
             // is ping
@@ -146,11 +146,11 @@ public class NVASession: Hashable, Equatable {
         }
     }
 
-    func sendReply(content: [String: Any]) {
+    func sendReply(content: [String: Any], replyingTo number: UInt32) {
         let str = try! JSON(content).rawData()
         let length = UInt32(str.count)
         var arr: [UInt8] = [0xc0, 0x01]
-        arr.append(contentsOf: nextVersion().toUInt8s)
+        arr.append(contentsOf: number.toUInt8s)
         arr.append(contentsOf: length.toUInt8s)
         var data = Data(arr)
         data.append(str)
@@ -181,9 +181,9 @@ public class NVASession: Hashable, Equatable {
         writeData(arr)
     }
 
-    func sendEmpty() {
+    func sendEmpty(replyingTo number: UInt32) {
         var arr: [UInt8] = [0xc0, 0x00]
-        arr.append(contentsOf: nextVersion().toUInt8s)
+        arr.append(contentsOf: number.toUInt8s)
         writeData(Data(arr))
     }
 
@@ -191,18 +191,14 @@ public class NVASession: Hashable, Equatable {
 
     init(_ socket: Socket) {
         self.socket = socket
-//        DispatchQueue.main.async {
-//            self.timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
-//                print("send ping")
-//                self?.sendPing()
-//            }
-//        }
+        let heartbeat = DispatchSource.makeTimerSource(queue: socketQueue)
+        heartbeat.schedule(deadline: .now() + 1, repeating: 1)
+        heartbeat.setEventHandler { [weak self] in self?.sendPing() }
+        self.heartbeat = heartbeat
+        heartbeat.resume()
     }
 
-    deinit {
-        timer?.invalidate()
-        socket.close()
-    }
+    deinit { close() }
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(socket)

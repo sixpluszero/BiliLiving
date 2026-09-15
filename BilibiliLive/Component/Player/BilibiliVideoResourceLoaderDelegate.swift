@@ -201,7 +201,9 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         // 首选 CDN 挂掉时 segment 会整体切到探测成功的备用 URL
         let segment = sidxResult.sidx
         let segmentURL = sidxResult.url
-        currentSegmentHost = URLComponents(string: segmentURL)?.host
+        if (info.info.width ?? 0) > 0 {
+            currentSegmentHost = URLComponents(string: segmentURL)?.host
+        }
         var playList = """
         #EXTM3U
         #EXT-X-VERSION:7
@@ -435,6 +437,11 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         masterPlaylist.append("\n#EXT-X-ENDLIST\n")
 
         Logger.debug("masterPlaylist: \(masterPlaylist)")
+    }
+
+    func selectPreferredCDNIfNeeded() async {
+        guard preferredHost == nil else { return }
+        preferredHost = await CDNDiagnostics.pickFastestHost(urls: cdnCandidates)
     }
 
     func prewarmPrimaryVideoIndex() async {

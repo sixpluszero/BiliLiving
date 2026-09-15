@@ -88,6 +88,7 @@ enum CDNDiagnostics {
     private static func probeAll(urls: [String], bytes: Int, session: Session) async -> [ProbeResult] {
         var results = [ProbeResult]()
         for url in urls {
+            guard !Task.isCancelled else { break }
             results.append(await probe(url: url, bytes: bytes, session: session))
         }
         return results

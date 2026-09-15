@@ -230,6 +230,15 @@ extension CommonPlayerViewController {
 }
 
 extension CommonPlayerViewController: AVPlayerViewControllerDelegate {
+    func playerViewController(_ playerViewController: AVPlayerViewController,
+                              timeToSeekAfterUserNavigatedFrom oldTime: CMTime,
+                              to targetTime: CMTime) -> CMTime {
+        if let player = playerViewController.player {
+            activePlugins.forEach { $0.playerWillSeek(player: player) }
+        }
+        return targetTime
+    }
+
     @objc func playerViewControllerShouldDismiss(_ playerViewController: AVPlayerViewController) -> Bool {
         if let presentedViewController = UIViewController.topMostViewController() as? CommonPlayerViewController,
            presentedViewController.playerVC == playerViewController

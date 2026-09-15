@@ -13,6 +13,7 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
 
     private weak var playerVC: AVPlayerViewController?
     private var playerDelegate: BilibiliVideoResourceLoaderDelegate?
+    private var bufferingController: VideoBufferingController?
     private let playInfo: PlayInfo
     private let playData: PlayerDetailData
     private let reportWatchHistory: Bool
@@ -72,6 +73,9 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         if let host = playerDelegate?.currentSegmentHost {
             lines.append("segment host: \(host)")
         }
+        if let item = playerVC?.player?.currentItem {
+            lines.append(String(format: "buffer: %.1fs / target %.0fs", bufferedSeconds(of: item), item.preferredForwardBufferDuration))
+        }
         if !cdnProbeReport.isEmpty {
             lines.append(cdnProbeReport)
         }
@@ -96,7 +100,20 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         startNetworkLogging()
     }
 
+    func playerDidChange(player: AVPlayer) {
+        bufferingController?.stop()
+        guard let item = player.currentItem else { return }
+        bufferingController = VideoBufferingController(
+            item: item, target: minimizeStalling ? Double(Settings.videoBufferDuration.rawValue) : 15)
+    }
+
+    func playerWillSeek(player: AVPlayer) {
+        bufferingController?.prepareForSeek()
+    }
+
     func playerDidCleanUp(player: AVPlayer) {
+        bufferingController?.stop()
+        bufferingController = nil
         stopNetworkLogging()
         player.pause()
         player.replaceCurrentItem(with: nil)
@@ -113,7 +130,15 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
             .first(where: { $0.identifier == UIMenu.Identifier(rawValue: "setting") }),
             let index = current.firstIndex(of: setting)
         {
-            current[index] = setting.replacingChildren(setting.children + [action])
+            let buffering = UIMenu(title: "视频预缓冲", children: VideoBufferDuration.allCases.map { duration in
+                UIAction(title: duration.title, state: Settings.videoBufferDuration == duration ? .on : .off) { [weak self] _ in
+                    Settings.videoBufferDuration = duration
+                    guard let self else { return }
+                    self.bufferingController?.updateTarget(self.minimizeStalling ? Double(duration.rawValue) : 15)
+                    (self.playerVC?.parent as? CommonPlayerViewController)?.updateMenus()
+                }
+            })
+            current[index] = setting.replacingChildren(setting.children + [buffering, action])
             return []
         }
         return []
@@ -193,11 +218,8 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     }
 
     private func bufferedSeconds(of item: AVPlayerItem) -> Double {
-        guard let range = item.loadedTimeRanges.first?.timeRangeValue else { return 0 }
-        let end = range.start.seconds + range.duration.seconds
-        let current = item.currentTime().seconds
-        guard end.isFinite, current.isFinite else { return 0 }
-        return max(0, end - current)
+        VideoBufferingController.bufferedSeconds(
+            in: item.loadedTimeRanges.map(\.timeRangeValue), at: item.currentTime().seconds)
     }
 
     /// 只根据真实卡顿触发换源：正在 waiting，或本周期新增了 stall。
@@ -330,43 +352,8 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         WebRequest.reportWatchHistory(aid: playData.aid, cid: playData.cid, currentTime: Int(currentTime), epid: playData.epid, seasonId: playData.seasonId, subType: playData.subType)
     }
 
-    /// 与资源加载器选主视频流的逻辑对齐，取出该流各 CDN host 的代表 URL，供起播轻量测速。
-    private func primaryCDNCandidates(from info: VideoPlayURLInfo, maxQuality: Int?, streamIndex: Int?) -> [String] {
-        var videos = info.dash.video
-        if Settings.preferAvc {
-            let videosMap = Dictionary(grouping: videos, by: { $0.id })
-            for (key, values) in videosMap {
-                if values.contains(where: { !$0.isHevc }) {
-                    videos.removeAll(where: { $0.id == key && $0.isHevc })
-                }
-            }
-        }
-        if let streamIndex, streamIndex < info.dash.video.count {
-            videos = [info.dash.video[streamIndex]]
-        } else if let maxQuality {
-            let matching = videos.filter { $0.id == maxQuality }
-            if let best = matching.max(by: { $0.bandwidth < $1.bandwidth }) {
-                videos = [best]
-            } else {
-                videos = matching
-            }
-        } else {
-            let qualityLimit = Settings.mediaQuality.qn
-            videos = videos.filter { $0.id <= qualityLimit }
-            if let highest = videos.map(\.id).max() {
-                videos = videos.filter { $0.id == highest }
-            }
-        }
-        videos.sort { $0.bandwidth > $1.bandwidth }
-        guard let primary = videos.first else { return [] }
-        var seenHosts = Set<String>()
-        return primary.playableURLs.filter { url in
-            guard let host = URLComponents(string: url)?.host else { return false }
-            return seenHosts.insert(host).inserted
-        }
-    }
-
     func playerWillCleanUp(playerVC: AVPlayerViewController) {
+        bufferingController?.stop()
         invalidatePendingLoad(tearingDown: true)
     }
 
@@ -477,21 +464,12 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         lastMaxQuality = maxQuality
         lastStreamIndex = streamIndex
 
-        var resolvedHost = preferredHost
-        if resolvedHost == nil {
-            let candidates = primaryCDNCandidates(from: urlInfo, maxQuality: maxQuality, streamIndex: streamIndex)
-            if let best = await CDNDiagnostics.pickFastestHost(urls: candidates) {
-                resolvedHost = best
-                Logger.info("[cdn] 起播选用 host: \(best)")
-            }
-        }
-
         return try await PlayerMediaFactory.prepare(aid: playData.aid,
                                                     urlInfo: urlInfo,
                                                     playerInfo: playerInfo,
                                                     maxQuality: maxQuality,
                                                     streamIndex: streamIndex,
-                                                    preferredHost: resolvedHost)
+                                                    preferredHost: preferredHost)
     }
 
     @MainActor
@@ -560,10 +538,8 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         // 0 表示无限制，让 AVPlayer 根据网络条件自动选择最高可用码率
         playerItem.preferredPeakBitRate = 0
 
-        // 之前设成 60s 是为了扛 CDN 吞吐抖动，但 BANDWIDTH 声明错误的根因已修复，
-        // 实测 CDN 吞吐充裕，不再需要这么激进的预缓冲。60s 在连续快进时的副作用是：
-        // 每次 seek 都会立刻为新位置起一大批 60s 的 range 请求，下一个 seek 一来又整体取消重来，
-        // 密集 seek 下网络连接层疲于开连接/取消，表现为长时间无响应。降到 15s 大幅减少这种抖动。
+        // Begin with a small seek/startup window. playerDidChange installs a
+        // controller that expands it once the playback position settles.
         playerItem.preferredForwardBufferDuration = 15
 
         let player = AVPlayer(playerItem: playerItem)

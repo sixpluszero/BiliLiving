@@ -66,3 +66,59 @@
 手动检查：“我的”页投屏卡片布局、遥控器焦点、开关关闭/开启与状态更新，最终保持投屏开启。[界面截图](screenshots/casting.png)。
 
 这些测试是独立模拟手机客户端通过真实网络协议驱动 tvOS 模拟器，不是 iPhone 官方客户端实测。手机端发现、真机局域网组播、后台/休眠、会员内容授权、番剧与手机端协议版本兼容性需实机验证，详见 [CASTING.md](CASTING.md)。
+
+## 投屏启动与前向缓冲修补验证
+
+环境：Xcode 26.6 / tvOS 26.5 Simulator。完整回归 **13 项通过，0 失败**（24.306 秒），结果 `build/Tests-20260914-204408.xcresult`。随后统一 CDN 测速入口，针对真实播放与投屏接力重新验证 **2 项通过，0 失败**（18.871 秒），结果 `build/BufferCast-Playback-Verification.xcresult`。
+
+新增及加强的检查：
+
+- 占用 HTTP 9958，接收端自动选择可用端口，SSDP LOCATION 与实际 HTTP 服务端口一致。
+- 保持端口冲突，连续关闭/开启 5 次，每次 HTTP 设备描述可读、NVA SETUP 可连接；恢复默认端口后也可运行。
+- 连续跳转期间不提前恢复大缓冲；停止控制器后取消延迟写入；缓冲长度不跨越未下载的区间。
+- 真实在线视频前向缓冲超过 20 秒，并确认目标为 120 秒。两轮观测值分别约 48 秒、38 秒；这只是检查时的瞬时值，不是缓存上限。
+- 画质切换仍保留暂停/进度，恢复播放后时间继续前进；已有投屏起播、控制、断线续播及重连验证均通过。
+
+游客测试无法覆盖会员 4K。真机投屏启动原因、实际官方手机客户端发现及美国跨境线路的长时间 4K 表现仍待复测。详见 [投屏说明](CASTING.md) 与 [预缓冲说明](PLAYBACK-BUFFERING.md)。
+
+### 真机日志定位后的最终回归
+
+读取旧版客厅 Apple TV 日志后确认投屏报 `Address already in use`。进一步增加 UDP 1900 占用时绑定 SSDP 组播地址的恢复路径，并新增真实组播验证（非 loopback 单播替代）。最终完整回归 **14 项通过，0 失败**，26.260 秒，结果 `build/Tests-20260914-205011.xcresult`；真实视频检查时的连续前向缓冲约 48 秒。真机 Release 无签名构建通过。
+
+UDP 冲突测试先以未开启端口复用的 socket 独占 `*:1900`，再启动接收端，通过工作网卡向 `239.255.255.250:1900` 发送 M-SEARCH，并收到实际单播发现应答。HTTP 端口冲突和重复重启测试也继续通过。
+
+## NVA 握手与起播兼容性修补
+
+2026-09-14 完整回归 **15 项通过，0 失败**，26.844 秒，结果 `build/Tests-20260914-211704.xcresult`。随后补齐服务 XML 外层结构，针对身份、服务描述、握手、回复序号、心跳及 RESTORE 的测试再次通过，结果 `build/NVA-Identity-Service-Verification.xcresult`。
+
+与之前宽松的模拟手机相比，现在发送 `SETUP /projection NVA/1.0`，严格检查完整响应状态行和 NVA 头，独立解析二进制帧。连续发送不同序号的 GetVolume/Pause/GetVolume，要求各自得到匹配的回复；验证心跳与 RESTORE。真实视频接力测试在 GetVolume 握手指令正确返回后才发送 Play，随后检查起播、进度、暂停、跳转、断线续播与恢复控制。
+
+已通过 devicectl 读取旧版真机日志确认服务启动成功但没有 NVA session；本次尚未在官方手机 App 上确认修补后的起播。说明见 [CASTING.md](CASTING.md)。
+
+## “我的”页面方向焦点修补
+
+账号入口（游客扫码登录，或登录后的收藏/历史/稍后再看）以及观看偏好按钮行，统一采用整行宽度加 `.focusSection()`，与投屏卡片的焦点区域对齐。原来只有投屏卡片拥有覆盖整行的焦点区域，从顶部导航向下或从右侧投屏按钮向上时，左侧较短的按钮行容易被跳过。
+
+本次为布局修补，没有新增仅断言修饰符存在的自动化测试。界面控制工具连接 Simulator 连续超时，尚未执行遥控器方向操作验证。
+
+tvOS Release 无签名构建通过，安装包 `build/artifacts/BiliLiving-focus-20260914.ipa` 已完成 ZIP 完整性校验，包含此前的投屏与缓冲修补。
+
+待真机检查路径：顶部“我的”向下进入账号入口；登录后的收藏/历史/稍后再看能左右移动；向下进入投屏、向上返回账号入口；投屏与观看偏好能双向移动；从账号入口向上返回顶栏。游客登录按钮也应可通过相同路径到达。
+
+实现依据：[Apple focusSection 文档](https://developer.apple.com/documentation/swiftui/view/focussection())。
+
+## 官方手机走 DLNA SOAP 的起播修补
+
+真机日志确认手机在 21:45–21:46 发来 `/AVTransport/action`，旧处理器返回 HTTP 400。新增这条路径后，完整回归 **17 项通过，0 失败**，36.813 秒，结果 `build/Tests-20260914-215606.xcresult`。
+
+新增验证：
+
+- 独立 HTTP SOAP 客户端发送 SetAVTransportURI、Play；不建立 NVA 会话。
+- 包含 nva_ext 的 URL 播放真实 B 站视频，从手机指定的第 37 秒起播，播放时钟增长。
+- 更换为 Apple 官方 HLS 测试流，验证无 B 站标识的直接地址播放、真实时长回传。
+- 两类视频均执行暂停、跳转至第 54 秒、恢复并继续播放；Stop 退出；无效地址/无媒体跳转返回 HTTP 500 SOAP Fault，之后仍可再次播放。
+- 请求/响应 XML 有效；URL 的 `&amp;` 与中文元数据正确解码；不匹配的 SOAPAction、畸形 XML、不支持的 URL scheme、无效 nva_ext 及无效时间拒绝。
+
+这是实际 HTTP 请求驱动模拟器 AVPlayer 的测试，尚不代表官方手机客户端到 Apple TV 真机已经复测成功。
+
+最终代码的两项 SOAP 专项回归再次通过（11.104 秒），结果 `build/SOAP-Final-Verification.xcresult`。tvOS Release 无签名构建通过，产物 `build/artifacts/BiliLiving-dlna-playback-20260914.ipa` 已校验 ZIP 完整性，包含之前的焦点及缓冲修补。

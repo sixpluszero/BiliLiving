@@ -176,6 +176,13 @@ class SettingsViewController: UIViewController {
             }
 
             SectionModel(title: "音视频") {
+                Actions(title: "视频预缓冲", message: "提前加载后续内容，减少跨境网络波动造成的卡顿。更长缓冲会增加流量和内存占用；实际长度由系统与网速决定。下次播放生效。",
+                        current: Settings.videoBufferDuration.title,
+                        options: VideoBufferDuration.allCases,
+                        optionString: VideoBufferDuration.allCases.map(\.title))
+                {
+                    Settings.videoBufferDuration = $0
+                }
                 Actions(title: "最高画质", message: "4k以上需要大会员",
                         current: Settings.mediaQuality.desp,
                         options: MediaQualityEnum.allCases,

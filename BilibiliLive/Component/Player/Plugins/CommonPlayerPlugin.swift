@@ -23,6 +23,7 @@ protocol CommonPlayerPlugin: NSObject {
     func playerDidPause(player: AVPlayer)
     func playerDidEnd(player: AVPlayer)
     func playerDidStall(player: AVPlayer)
+    func playerWillSeek(player: AVPlayer)
     func playerDidFail(player: AVPlayer)
     func playerDidCleanUp(player: AVPlayer)
 }
@@ -36,6 +37,7 @@ extension CommonPlayerPlugin {
     func playerDidPause(player: AVPlayer) {}
     func playerDidEnd(player: AVPlayer) {}
     func playerDidStall(player: AVPlayer) {}
+    func playerWillSeek(player: AVPlayer) {}
     func playerDidFail(player: AVPlayer) {}
     func playerDidCleanUp(player: AVPlayer) {}
 

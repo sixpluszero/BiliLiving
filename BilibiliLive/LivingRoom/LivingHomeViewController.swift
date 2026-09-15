@@ -128,15 +128,25 @@ struct LivingLibraryView: View {
                     Text(loggedIn ? "继续喜欢的内容，发现新的灵感。" : "无需登录，搜索、看视频和弹幕。登录后可同步收藏与观看记录。").font(.system(size: 25)).foregroundStyle(.secondary)
                 }
             }
-            if !loggedIn {
-                Button { AppDelegate.shared.showLogin() } label: { Label("扫码登录", systemImage: "qrcode.viewfinder") }.accessibilityIdentifier("living.login")
-            } else {
-                HStack(spacing: 28) {
+            // Match the full-width casting section's focus region. Without
+            // this, Down from the tab bar (or Up from the right-hand cast
+            // button) misses the shorter, left-aligned account buttons.
+            HStack(spacing: 28) {
+                if !loggedIn {
+                    Button { AppDelegate.shared.showLogin() } label: {
+                        Label("扫码登录", systemImage: "qrcode.viewfinder")
+                    }.accessibilityIdentifier("living.login")
+                } else {
                     Button { open(.favorite) } label: { Label("我的收藏", systemImage: "heart") }
+                        .accessibilityIdentifier("living.library.favorite")
                     Button { open(.history) } label: { Label("观看历史", systemImage: "clock") }
+                        .accessibilityIdentifier("living.library.history")
                     Button { open(.toView) } label: { Label("稍后再看", systemImage: "bookmark") }
+                        .accessibilityIdentifier("living.library.toView")
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .focusSection()
             LivingCastView()
             Divider().padding(.vertical, 10)
             Text("观看偏好").font(.system(size: 32, weight: .bold))
@@ -145,10 +155,13 @@ struct LivingLibraryView: View {
                     Label(defaults.showDanmu ? "弹幕已开启" : "弹幕已关闭", systemImage: defaults.showDanmu ? "text.bubble.fill" : "text.bubble")
                 }.accessibilityIdentifier("living.danmaku.toggle")
                 Button(action: settings) { Label("播放设置", systemImage: "slider.horizontal.3") }
+                    .accessibilityIdentifier("living.library.settings")
                 if loggedIn {
                     Button("退出登录") { ApiRequest.logout { _ in loggedIn = ApiRequest.isLogin() } }
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .focusSection()
             Text("默认优先 1080p，可在播放器中切换清晰度。\n搜索时可打字输入，或按住 Siri 遥控器麦克风键听写。")
                 .font(.system(size: 24)).foregroundStyle(.secondary).lineSpacing(12)
                 .lineLimit(3).fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
