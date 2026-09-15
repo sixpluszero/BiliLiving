@@ -202,8 +202,10 @@ final class BiliLivingTests: XCTestCase {
         let probe = CastMulticastProbe()
         defer { probe.close() }
         try probe.search(interface: interface)
-        try await eventually { probe.text.contains("HTTP/1.1 200 OK") }
-        XCTAssertTrue(probe.text.contains("LOCATION:"))
+        // Other renderers (including the user's Apple TV) may answer first.
+        // Wait for this receiver's advertised URL, not any device's response.
+        try await eventually { probe.text.contains("HTTP/1.1 200 OK") && probe.text.contains(location) }
+        XCTAssertTrue(probe.text.contains(location))
     }
 
     @MainActor func testCastPortConflictAndRapidRestart() async throws {
@@ -457,6 +459,86 @@ final class BiliLivingTests: XCTestCase {
         let text = String(decoding: data, as: UTF8.self)
         XCTAssertTrue(text.contains(expectedStatus == 200 ? "\(action)Response" : "UPnPError"))
         return text
+    }
+
+    func testCastVideoHintUsesTrustedCDNAndXMLTitle() throws {
+        let uri = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/70/08/38601820870/38601820870-1-192.mp4?ignored=1"
+        let metadata = "<DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><item><dc:title>标题 &amp; 分P</dc:title></item></DIDL-Lite>"
+        let hint = try XCTUnwrap(LivingCastVideoHint(url: URL(string: uri)!, metadata: metadata))
+        XCTAssertEqual(hint.cid, 38601820870)
+        XCTAssertEqual(hint.title, "标题 & 分P")
+        XCTAssertNil(LivingCastVideoHint(url: URL(string: uri.replacingOccurrences(of: "upos-hz-mirrorakam.akamaized.net", with: "unrelated.example"))!, metadata: metadata))
+        XCTAssertNil(LivingCastVideoHint(url: URL(string: uri.replacingOccurrences(of: "38601820870-1", with: "123-1"))!, metadata: metadata))
+        XCTAssertNil(LivingCastVideoHint(url: URL(string: uri)!, metadata: "<broken>")?.title)
+    }
+
+    @MainActor func testCastCapturedVideoResolvesByExactCID() async throws {
+        // Only public title/CID from the real DLNA report; no signed URL or phone credentials.
+        let uri = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/70/08/38601820870/38601820870-1-192.mp4"
+        let metadata = "<DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><item><dc:title>老戴《007 初露锋芒》最高难度剧情流程攻略解说</dc:title></item></DIDL-Lite>"
+        let hint = try XCTUnwrap(LivingCastVideoHint(url: URL(string: uri)!, metadata: metadata))
+        let resolved = await LivingCastVideoResolver.resolve(hint)
+        let info = try XCTUnwrap(resolved, "The user's actual cast must resolve within the startup deadline")
+        let detail = try await WebRequest.requestDetailVideo(aid: info.aid)
+        XCTAssertEqual(info.cid, hint.cid)
+        XCTAssertNotNil(LivingCastVideoResolver.matchingPage(in: detail.View, cid: hint.cid))
+        XCTAssertNil(LivingCastVideoResolver.matchingPage(in: detail.View, cid: 1), "Never select a same-title video with a different CID")
+        let playerVC = VideoPlayerViewController(playInfo: info, startTimeOverride: 0)
+        let root = try XCTUnwrap(AppDelegate.shared.window?.rootViewController)
+        root.present(playerVC, animated: false)
+        defer { playerVC.stopPlayback(); playerVC.dismiss(animated: false) }
+        try await eventually(timeout: 60) {
+            let player = (playerVC.children.first as? AVPlayerViewController)?.player
+            return (player?.currentTime().seconds ?? 0) > 1
+        }
+        let av = try XCTUnwrap(playerVC.children.first as? AVPlayerViewController)
+        func titles(_ items: [UIMenuElement]) -> [String] { items.flatMap { [$0.title] + (($0 as? UIMenu).map { titles($0.children) } ?? []) } }
+        let menuTitles = titles(av.transportBarCustomMenuItems)
+        XCTAssertTrue(menuTitles.contains(where: { $0.contains("清晰度") }))
+        XCTAssertTrue(menuTitles.contains("Show Danmu"))
+        playerVC.stopPlayback()
+        await withCheckedContinuation { continuation in
+            playerVC.dismiss(animated: false) { continuation.resume() }
+        }
+    }
+
+    @MainActor func testDirectCastStreamRendersRealDanmaku() async throws {
+        let previousShow = Defaults.shared.showDanmu
+        let previousAI = Settings.danmuAILevel
+        let previousFilter = Settings.enableDanmuFilter
+        Defaults.shared.showDanmu = true
+        Settings.danmuAILevel = 1
+        Settings.enableDanmuFilter = false
+        let cid = 38601820870
+        let list = try await WebRequest.requestDanmuList(cid: cid, segmentIdx: 1)
+        let comment = try XCTUnwrap(list.elems.first { $0.mode == 1 && $0.progress > 3000 && $0.progress < 100000 })
+        // Isolate overlay wiring with a stable playable HLS fixture and actual
+        // Bilibili comments; title/CID identity is covered by the resolver test.
+        let url = URL(string: "https://devstreaming-cdn.apple.com/videos/streaming/examples/bipbop_adv_example_hevc/master.m3u8")!
+        let vc = LivingURLCastViewController(url: url, context: LivingCastContext(), danmakuCID: cid)
+        let root = try XCTUnwrap(AppDelegate.shared.window?.rootViewController)
+        root.present(vc, animated: false)
+        defer {
+            vc.stopPlayback(); vc.dismiss(animated: false)
+            Defaults.shared.showDanmu = previousShow
+            Settings.danmuAILevel = previousAI
+            Settings.enableDanmuFilter = previousFilter
+        }
+        func descendants(_ view: UIView) -> [UIView] { view.subviews.flatMap { [$0] + descendants($0) } }
+        try await eventually(timeout: 30) {
+            descendants(vc.view).contains { $0 is DanmakuView } &&
+            ((vc.children.first as? AVPlayerViewController)?.player?.currentTime().seconds ?? 0) > 1
+        }
+        let av = try XCTUnwrap(vc.children.first as? AVPlayerViewController)
+        let player = try XCTUnwrap(av.player)
+        await player.seek(to: CMTime(seconds: max(0, Double(comment.progress) / 1000 - 2), preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        try await eventually(timeout: 15) { descendants(vc.view).contains { $0 is DanmakuCell } }
+        func titles(_ items: [UIMenuElement]) -> [String] { items.flatMap { [$0.title] + (($0 as? UIMenu).map { titles($0.children) } ?? []) } }
+        XCTAssertTrue(titles(av.transportBarCustomMenuItems).contains("Show Danmu"))
+        vc.stopPlayback()
+        await withCheckedContinuation { continuation in
+            vc.dismiss(animated: false) { continuation.resume() }
+        }
     }
 
     @MainActor private func eventually(timeout: TimeInterval = 10, _ condition: () -> Bool) async throws {

@@ -74,3 +74,13 @@
 日志仅记录经过校验的动作名称、媒体类型和错误码，不记录手机提供的 URI、元数据或令牌。尚未实现 DLNA SUBSCRIBE 事件推送；本轮真机日志只有 HTTP 动作请求，标准状态查询已支持。
 
 协议参考：[UPnP AVTransport 规范](https://www.upnp.org/specs/av/UPnP-av-AVTransport-v3-Service.pdf)。直接地址回归使用 [Apple HLS 测试流](https://developer.apple.com/streaming/examples/advanced-stream-hevc.html)。官方手机与真机仍待此安装包复测。
+
+## DLNA 720p 链接升级为电视端原生播放
+
+2026-09-14 的真机 SOAP GetMediaInfo 显示：手机提供 `upos-hz-mirrorakam.akamaized.net/upgcxcode/.../<cid>/<cid>-1-192.mp4`，没有 `nva_ext`；DIDL-Lite 中有视频标题，没有明文 AV/BV 号。旧逻辑因此进入只带 URL 的播放器，没有清晰度列表和弹幕插件。
+
+现在从可信 B 站 CDN 路径读取 CID、从 DIDL-Lite 的 dc:title 读取标题。电视已登录时，以标题搜索候选，优先完整标题匹配，再向 B 站查询分 P 列表；只有 CID 完全一致才切换为现有 VideoPlayerViewController。原生播放器使用电视账号重新取流，带清晰度、弹幕、倍速和缓冲设置。搜索只是候选来源，不能用同名视频替代原视频。
+
+识别最多等待 8 秒，检查最多 5 个候选，成功结果在进程内按 CID 缓存（最多 32 项）。缺少标题、超时、网络失败或匹配失败时保留手机原始媒体地址；只要可信 CID 可用，原地址播放器也会独立获取弹幕并提供开关。游客保留原地址，避免游客 API 返回的清晰度比手机提供的 720p 更低。
+
+高清档位在电视播放器菜单内选择，默认仍优先 1080p。手机投屏控制页可能继续只显示 720p、无弹幕，这不反映电视独立取流和渲染的能力。实际可用画质由电视登录账号、视频源及 API 返回决定；没有改变账号权限，也没有读取手机令牌或解密 opaque 元数据。匹配不到的直接媒体流仍维持其原有清晰度。

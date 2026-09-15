@@ -122,3 +122,19 @@ tvOS Release 无签名构建通过，安装包 `build/artifacts/BiliLiving-focus
 这是实际 HTTP 请求驱动模拟器 AVPlayer 的测试，尚不代表官方手机客户端到 Apple TV 真机已经复测成功。
 
 最终代码的两项 SOAP 专项回归再次通过（11.104 秒），结果 `build/SOAP-Final-Verification.xcresult`。tvOS Release 无签名构建通过，产物 `build/artifacts/BiliLiving-dlna-playback-20260914.ipa` 已校验 ZIP 完整性，包含之前的焦点及缓冲修补。
+
+## DLNA 高清取流与弹幕恢复
+
+使用真机 GetMediaInfo 中的公开标题及 CID（不保存签名 URL、手机标识或 opaque 元数据）构造回归样例，成功识别用户实际投送的多分 P 视频。识别结果通过 B 站分 P 列表的 CID 完全匹配校验，真实原生播放起播，电视清晰度和弹幕菜单存在。游客模拟器未验证登录后的 1080p/4K 权限。
+
+新增直接媒体播放器的弹幕验证：使用 Apple HLS 作为稳定播放载体、B 站真实 protobuf 弹幕作为内容源，确认 DanmakuCell 实际出现在播放器视图中，并且弹幕菜单可用。这项测试隔离验证渲染与生命周期；视频/弹幕身份一致性由 CID 识别测试单独验证。
+
+实现中修正了搜索结果 Set 去重打乱顺序导致候选遗漏的问题：先检查完整标题匹配候选，只查询必要的稿件和分 P 信息。最初的回归也暴露出测试页面未等退出动画完成的问题，新增测试现等待 dismissal completion，避免影响后面的游客登录检查。
+
+完整回归结果 `build/Tests-20260914-222027.xcresult`：20 项中 19 项通过，唯一失败是原有组播测试把其他设备的首条应答当成本机应答。将其改为等待本接收器的实际 LOCATION 后进行专项重测；没有屏蔽断言或关闭真机服务。
+
+专项结果 `build/Cast-Enhanced-Final-Verification.xcresult`：视频 CID 识别与真实原生起播、可信 CDN/XML 解析、直接流弹幕渲染、游客登录检查共 4 项通过；加强断言后的组播测试仍超时，未收到匹配本机 LOCATION 的应答，原因尚未确定。该测试不再将其他设备的应答计为本接收器成功；没有修改本次已工作的真机发现实现。不能将本轮记录表述为全套测试通过。
+
+tvOS Release 无签名构建通过，产物 `build/artifacts/BiliLiving-cast-hd-danmaku-20260914.ipa` 已完成 ZIP 完整性检查。账号授权的 1080p/4K 及官方手机到真机的新取流路径仍待安装后复测。
+
+后续用户反馈：已完成该版本的手动测试，并要求提交本次改动。

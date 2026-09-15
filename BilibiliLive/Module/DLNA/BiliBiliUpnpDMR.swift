@@ -498,7 +498,7 @@ extension BiliBiliUpnpDMR {
         }
     }
 
-    @MainActor private func presentCast(position: Int, makePlayer: @escaping (LivingCastContext) -> CommonPlayerViewController) {
+    @MainActor private func presentCast(position: Int, makePlayer: @escaping (LivingCastContext) async -> CommonPlayerViewController) {
         presentationTask?.cancel()
         currentPlugin = nil
         let context = LivingCastContext()
@@ -515,7 +515,8 @@ extension BiliBiliUpnpDMR {
                 }
             }
             guard !Task.isCancelled, self.castContext === context else { return }
-            let player = makePlayer(context)
+            let player = await makePlayer(context)
+            guard !Task.isCancelled, self.castContext === context else { return }
             player.autoPlayWhenReady = !context.paused
             (player as? VideoPlayerViewController)?.onLoadFailure = { [weak self, weak context] message in
                 guard let self, let context, self.castContext === context else { return }
@@ -572,8 +573,17 @@ extension BiliBiliUpnpDMR {
                     switch media {
                     case let .video(request): playVideo(request: request)
                     case let .url(url):
+                        let metadata = soapMetadata
                         presentCast(position: 0) { context in
-                            LivingURLCastViewController(url: url, context: context)
+                            let hint = LivingCastVideoHint(url: url, metadata: metadata)
+                            // A guest API response can be lower quality than
+                            // the phone's 720p stream. Keep that stream for guests.
+                            if ApiRequest.isLogin(), let hint, let info = await LivingCastVideoResolver.resolve(hint) {
+                                Logger.info("[cast] resolved native video aid=\(info.aid), cid=\(hint.cid)")
+                                return VideoPlayerViewController(playInfo: info, startTimeOverride: 0, castContext: context)
+                            }
+                            Logger.info("[cast] keeping direct stream, danmaku CID available=\(hint != nil)")
+                            return LivingURLCastViewController(url: url, context: context, danmakuCID: hint?.cid)
                         }
                     }
                 }
