@@ -1,5 +1,6 @@
 import XCTest
 import AVKit
+import Network
 @testable import BilibiliLive
 
 final class BiliLivingTests: XCTestCase {
@@ -118,4 +119,180 @@ final class BiliLivingTests: XCTestCase {
         root.dismiss(animated: false)
     }
 
+    func testCastRequestValidationAndPlayURL() throws {
+        let content = try LivingCastRequest.content(action: "Play", body: #"{"aid":"123","cid":"456","seekTs":"37.8","access_key":"ignored"}"#)
+        let request = try LivingCastRequest(json: content)
+        XCTAssertEqual(request.playInfo.aid, 123)
+        XCTAssertEqual(request.playInfo.cid, 456)
+        XCTAssertEqual(request.position, 37)
+        let ext = #"{"content":{"aid":123,"cid":456,"seekTs":0}}"#
+        var url = URLComponents(string: "https://example.com/video")!
+        url.queryItems = [URLQueryItem(name: "nva_ext", value: ext)]
+        let body = String(data: try JSONSerialization.data(withJSONObject: ["url": url.string!]), encoding: .utf8)!
+        let wrapped = try LivingCastRequest.content(action: "PlayUrl", body: body)
+        XCTAssertEqual(try LivingCastRequest(json: wrapped).position, 0)
+        for body in [#"{"aid":0}"#, #"{"aid":123,"seekTs":-1}"#, #"{"aid":123,"seekTs":"NaN"}"#, #"{"aid":123,"seekTs":true}"#] {
+            XCTAssertThrowsError(try LivingCastRequest(json: LivingCastRequest.content(action: "Play", body: body)))
+        }
+    }
+
+    @MainActor func testCastDiscoveryAndMalformedConnectionRecovery() async throws {
+        let receiver = BiliBiliUpnpDMR.shared
+        let previous = Settings.enableDLNA
+        receiver.setEnabled(true)
+        defer { receiver.setEnabled(previous) }
+        XCTAssertTrue(receiver.isRunning)
+        let (data, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:9958/description.xml")!)
+        XCTAssertTrue(String(decoding: data, as: UTF8.self).contains(BiliBiliUpnpDMR.deviceName))
+        let (_, debugResponse) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:9958/debug/log")!)
+        XCTAssertEqual((debugResponse as? HTTPURLResponse)?.statusCode, 404)
+        let discovery = CastTestPhone(port: 1900, udp: true)
+        defer { discovery.close() }
+        try await discovery.connect()
+        try await discovery.send(Data("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nST: urn:schemas-upnp-org:device:MediaRenderer:1\r\nMX: 1\r\n\r\n".utf8))
+        try await eventually { discovery.text.contains("HTTP/1.1 200 OK") }
+        XCTAssertTrue(discovery.text.contains("ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n"))
+        let invalid = CastTestPhone()
+        try await invalid.setup()
+        try await eventually { receiver.connectedCount == 1 }
+        // A claimed 4 GB JSON body must close this connection without allocating it or crashing the app.
+        var packet = CastTestPhone.command("Play", body: "")
+        packet.replaceSubrange((packet.count - 4)..<packet.count, with: [255, 255, 255, 255])
+        try await invalid.send(packet)
+        try await eventually { receiver.connectedCount == 0 }
+        invalid.close()
+        let fresh = CastTestPhone()
+        defer { fresh.close() }
+        try await fresh.setup()
+        try await eventually { receiver.connectedCount == 1 }
+        XCTAssertTrue(receiver.isRunning)
+        try await fresh.send(CastTestPhone.command("Play", body: #"{"aid":0}"#))
+        try await eventually { receiver.status.contains("有效的视频") }
+        receiver.start() // Idempotent start must preserve an established phone connection.
+        XCTAssertEqual(receiver.connectedCount, 1)
+        receiver.didEnterBackground()
+        XCTAssertFalse(receiver.isRunning)
+        receiver.willEnterForeground()
+        try await eventually { receiver.isRunning }
+        receiver.setEnabled(false)
+        XCTAssertFalse(receiver.isRunning)
+        XCTAssertEqual(receiver.connectedCount, 0)
+    }
+
+    @MainActor func testCastLiveHandoffControlsAndReconnect() async throws {
+        let receiver = BiliBiliUpnpDMR.shared
+        let previous = Settings.enableDLNA
+        let previousDanmaku = Defaults.shared.showDanmu
+        receiver.setEnabled(true)
+        let phone = CastTestPhone()
+        let reconnected = CastTestPhone()
+        defer {
+            phone.close(); reconnected.close()
+            receiver.currentPlugin?.player?.pause()
+            AppDelegate.shared.window?.rootViewController?.dismiss(animated: false)
+            Defaults.shared.showDanmu = previousDanmaku
+            receiver.setEnabled(previous)
+        }
+        let videos = try await WebRequest.requestHotVideo(page: 1).list
+        let video = try XCTUnwrap(videos.first { $0.duration > 100 })
+        try await phone.setup()
+        try await eventually { receiver.connectedCount == 1 }
+        let payload = "{\"aid\":\(video.aid),\"cid\":\(video.cid),\"seekTs\":37}"
+        try await phone.send(CastTestPhone.command("Play", body: payload))
+        try await eventually(timeout: 60) {
+            guard let player = receiver.currentPlugin?.player else { return false }
+            return player.rate > 0 && player.currentTime().seconds >= 37 && player.currentTime().seconds < 43
+        }
+        // Replace an active cast. All three commands arrive before the new stream has loaded.
+        try await phone.send(CastTestPhone.command("Play", body: payload)
+                             + CastTestPhone.command("Pause")
+                             + CastTestPhone.command("Seek", body: #"{"seekTs":54}"#))
+        try await eventually(timeout: 60) {
+            guard let player = receiver.currentPlugin?.player else { return false }
+            return player.currentItem?.status == .readyToPlay && abs(player.currentTime().seconds - 54) < 2
+        }
+        let player = try XCTUnwrap(receiver.currentPlugin?.player)
+        XCTAssertEqual(player.rate, 0, "Pause received while loading must survive startup")
+        try await phone.send(CastTestPhone.command("Resume"))
+        try await eventually { player.currentTime().seconds > 56 }
+        try await phone.send(CastTestPhone.command("SwitchDanmaku", body: #"{"open":"false"}"#))
+        try await eventually { !Defaults.shared.showDanmu }
+        try await phone.send(CastTestPhone.command("Seek", body: #"{"seekTs":70}"#))
+        try await eventually { player.currentTime().seconds >= 70 }
+        phone.close()
+        try await eventually { receiver.connectedCount == 0 }
+        let position = player.currentTime().seconds
+        try await eventually { player.currentTime().seconds > position + 1 }
+        try await reconnected.setup()
+        try await eventually { receiver.connectedCount == 1 && reconnected.text.contains("OnProgress") }
+        XCTAssertTrue(reconnected.text.contains("OnPlayState"))
+        try await reconnected.send(CastTestPhone.command("Stop"))
+        try await eventually { receiver.currentPlugin == nil && AppDelegate.shared.window?.rootViewController?.presentedViewController == nil }
+    }
+
+    @MainActor private func eventually(timeout: TimeInterval = 10, _ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        XCTFail("Timed out waiting for casting state")
+        throw NSError(domain: "CastingTest", code: 1)
+    }
+
+}
+
+/// A phone-side NVA client over real TCP/UDP sockets, independent of the receiver's frame decoder.
+@MainActor private final class CastTestPhone {
+    private let connection: NWConnection
+    private var received = Data()
+    var text: String { String(decoding: received, as: UTF8.self) }
+    init(port: UInt16 = 9958, udp: Bool = false) {
+        connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!, using: udp ? .udp : .tcp)
+    }
+    func connect() async throws {
+        connection.start(queue: DispatchQueue(label: "casting.test.phone"))
+        let deadline = Date().addingTimeInterval(5)
+        while connection.state != .ready {
+            guard Date() < deadline else { throw NSError(domain: "CastConnect", code: 1) }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        receive()
+    }
+    func setup() async throws {
+        try await connect()
+        try await send(Data("SETUP /projection HTTP/1.1\r\nHost: 127.0.0.1:9958\r\nSession: simulator-phone\r\nContent-Length: 0\r\n\r\n".utf8))
+        let deadline = Date().addingTimeInterval(5)
+        while !text.contains("200 OK") {
+            guard Date() < deadline else { throw NSError(domain: "CastSetup", code: 1) }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+    private func receive() {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, ended, error in
+            Task { @MainActor in
+                guard let self else { return }
+                if let data { self.received.append(data) }
+                if !ended && error == nil { self.receive() }
+            }
+        }
+    }
+    func send(_ data: Data) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            connection.send(content: data, completion: .contentProcessed { error in
+                if let error { continuation.resume(throwing: error) } else { continuation.resume() }
+            })
+        }
+    }
+    func close() { connection.cancel() }
+    static func command(_ action: String, body: String = "") -> Data {
+        var data = Data([0xe0, 0x03, 0, 0, 0, 1, 1, 7])
+        data.append(Data("Command".utf8))
+        data.append(UInt8(action.utf8.count))
+        data.append(Data(action.utf8))
+        let length = UInt32(body.utf8.count)
+        data.append(contentsOf: [UInt8((length >> 24) & 255), UInt8((length >> 16) & 255), UInt8((length >> 8) & 255), UInt8(length & 255)])
+        data.append(Data(body.utf8))
+        return data
+    }
 }

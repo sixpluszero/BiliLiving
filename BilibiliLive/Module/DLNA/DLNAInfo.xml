@@ -6,7 +6,7 @@
 <device>
   <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
   <UDN>uuid:{{UUID}}</UDN>
-  <friendlyName>我的小电视</friendlyName>
+  <friendlyName>BiliLiving · 小电视</friendlyName>
   <manufacturer>Bilibili Inc.</manufacturer>
   <manufacturerURL>https://bilibili.com/</manufacturerURL>
   <modelDescription>云视听小电视</modelDescription>

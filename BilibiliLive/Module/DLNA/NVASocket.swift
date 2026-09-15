@@ -25,10 +25,10 @@ public func nvasocket(
             func read() throws {
                 while true {
                     let frame = try session.readFrame()
-                    if frame.paramCount == 0 {
-                        print("get pong")
+                    if frame.isPing {
+                        session.sendEmpty()
                     } else {
-                        if frame.isCommand {
+                        if frame.isCommand && frame.paramCount > 0 {
                             processor?(session, frame)
                         }
                     }
@@ -58,12 +58,32 @@ public class NVASession: Hashable, Equatable {
 
     var timer: Timer?
 
-    var currentVersion = 1
+    private let versionLock = NSLock()
+    private var version: UInt32 = 1
+    private func nextVersion() -> UInt32 {
+        versionLock.lock(); defer { versionLock.unlock() }
+        version &+= 1
+        return version
+    }
+    private func receivedVersion(_ value: UInt32) {
+        versionLock.lock(); defer { versionLock.unlock() }
+        version = value
+    }
+    func close() { socket.close() }
+    enum FrameError: Error { case malformed, oversized }
+    private func text(length: Int) throws -> String {
+        guard let value = String(bytes: try socket.read(length: length), encoding: .utf8) else { throw FrameError.malformed }
+        return value
+    }
+    private func uint32() throws -> UInt32 {
+        try socket.read(length: 4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+    }
     lazy var socketQueue = DispatchQueue(label: "nva-socket")
 
     public struct NVAFrame {
         // e0
         var isCommand = false
+        var isPing = false
         var paramCount: Int = 0 // 2 or 3  0 menans ping
         var number: UInt32 = 0
         var version = 0x01
@@ -79,20 +99,28 @@ public class NVASession: Hashable, Equatable {
         var frame = NVAFrame()
         let fst = try socket.read()
         frame.isCommand = fst == 0xe0
+        frame.isPing = fst == 0xe4
         frame.paramCount = try Int(socket.read())
 
-        let versions = try socket.read(length: 4)
-        let version = Data(versions).reversed().withUnsafeBytes({ $0.load(as: UInt32.self) })
+        guard [0xe0, 0xc0, 0xe4].contains(fst), frame.paramCount <= 3 else { throw FrameError.malformed }
+        let version = try uint32()
         frame.version = Int(version)
-        currentVersion = frame.version
+        receivedVersion(version)
 
         if frame.paramCount == 0 {
             // is ping
             return frame
         }
-        _ = try socket.read() // 0x01
+        if !frame.isCommand {
+            guard frame.paramCount == 1 else { throw FrameError.malformed }
+            let length = try uint32()
+            guard length <= 1_048_576 else { throw FrameError.oversized }
+            frame.body = try text(length: Int(length))
+            return frame
+        }
+        guard try socket.read() == 0x01 else { throw FrameError.malformed }
         frame.commandLength = try socket.read()
-        frame.command = try String(bytes: socket.read(length: Int(frame.commandLength)).reversed(), encoding: .utf8)!
+        frame.command = try text(length: Int(frame.commandLength))
 
         if fst != 0xe0 || frame.paramCount == 1 {
             Logger.debug("reply: \(frame.command)")
@@ -100,13 +128,13 @@ public class NVASession: Hashable, Equatable {
         }
 
         frame.actionLength = try socket.read()
-        frame.action = try String(bytes: socket.read(length: Int(frame.actionLength)), encoding: .utf8)!
+        frame.action = try text(length: Int(frame.actionLength))
 
         if frame.paramCount == 3 {
-            let p3L = try socket.read(length: 4)
-            let part3Length = Data(p3L).reversed().withUnsafeBytes({ $0.load(as: UInt32.self) })
+            let part3Length = try uint32()
+            guard part3Length <= 1_048_576 else { throw FrameError.oversized }
             frame.bodyLength = part3Length
-            frame.body = try String(bytes: socket.read(length: Int(frame.bodyLength)), encoding: .utf8)!
+            frame.body = try text(length: Int(frame.bodyLength))
         }
 
         return frame
@@ -122,8 +150,7 @@ public class NVASession: Hashable, Equatable {
         let str = try! JSON(content).rawData()
         let length = UInt32(str.count)
         var arr: [UInt8] = [0xc0, 0x01]
-        currentVersion += 1
-        arr.append(contentsOf: UInt32(currentVersion).toUInt8s)
+        arr.append(contentsOf: nextVersion().toUInt8s)
         arr.append(contentsOf: length.toUInt8s)
         var data = Data(arr)
         data.append(str)
@@ -132,8 +159,7 @@ public class NVASession: Hashable, Equatable {
 
     func sendPing() {
         var arr: [UInt8] = [0xe4, 0x00]
-        currentVersion += 1
-        arr.append(contentsOf: UInt32(currentVersion).toUInt8s)
+        arr.append(contentsOf: nextVersion().toUInt8s)
         writeData(Data(arr))
     }
 
@@ -141,8 +167,7 @@ public class NVASession: Hashable, Equatable {
         let str = try! JSON(content).rawData()
         let length = UInt32(str.count)
         var arr = Data([0xe0, 0x03])
-        currentVersion += 1
-        arr.append(contentsOf: UInt32(currentVersion).toUInt8s)
+        arr.append(contentsOf: nextVersion().toUInt8s)
         let command = "Command".data(using: .ascii)!
         arr.append(0x01)
         arr.append(UInt8(command.count))
@@ -158,8 +183,7 @@ public class NVASession: Hashable, Equatable {
 
     func sendEmpty() {
         var arr: [UInt8] = [0xc0, 0x00]
-        currentVersion += 1
-        arr.append(contentsOf: UInt32(currentVersion).toUInt8s)
+        arr.append(contentsOf: nextVersion().toUInt8s)
         writeData(Data(arr))
     }
 

@@ -5,6 +5,8 @@
 //  Created by yicheng on 2022/11/25.
 //
 
+import Combine
+import Network
 import CocoaAsyncSocket
 import CoreMedia
 import Foundation
@@ -12,7 +14,25 @@ import Swifter
 import SwiftyJSON
 import UIKit
 
-class BiliBiliUpnpDMR: NSObject {
+class BiliBiliUpnpDMR: NSObject, ObservableObject {
+    static let deviceName = "BiliLiving · 小电视"
+    @Published private(set) var status = "投屏已关闭"
+    @Published private(set) var isRunning = false
+    @Published private(set) var connectedCount = 0
+    private var configured = false
+    private let pathMonitor = NWPathMonitor()
+    private var foreground = true
+    private var castContext: LivingCastContext?
+    private weak var castPlayer: VideoPlayerViewController?
+    private var presentationTask: Task<Void, Never>?
+    private var lastStatus: PlayStatus = .stop
+    private var lastDuration = 0
+    private var lastPosition = 0
+
+    @MainActor func setEnabled(_ enabled: Bool) {
+        Settings.enableDLNA = enabled
+        start()
+    }
     static let shared = BiliBiliUpnpDMR()
 
     private let ssdpHost = "239.255.255.250"
@@ -63,8 +83,9 @@ class BiliBiliUpnpDMR: NSObject {
     }()
 
     override private init() { super.init() }
-    func start() {
-        startIfNeed()
+    @MainActor func start() {
+        if configured { startIfNeed(); return }
+        configured = true
         NotificationCenter.default.addObserver(self, selector: #selector(didEnterBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(willEnterForeground), name: UIApplication.willEnterForegroundNotification, object: nil)
 
@@ -76,16 +97,27 @@ class BiliBiliUpnpDMR: NSObject {
         httpServer["/projection"] = nvasocket(uuid: bUuid, didConnect: { [weak self] session in
             Logger.info("session connected \(session)")
             DispatchQueue.main.async {
-                self?.sessions.insert(session)
+                guard let self, self.started, self.sessions.count < 4 else { session.close(); return }
+                self.sessions.insert(session)
+                self.connectedCount = self.sessions.count
+                self.status = "手机已连接"
+                session.sendCommand(action: "OnPlayState", content: ["playState": self.lastStatus.rawValue])
+                session.sendCommand(action: "OnProgress", content: ["duration": self.lastDuration, "position": self.lastPosition])
             }
         }, didDisconnect: { [weak self] session in
             Logger.info("session disconnect \(session)")
             DispatchQueue.main.async {
-                self?.sessions.remove(session)
+                guard let self else { return }
+                self.sessions.remove(session)
+                self.connectedCount = self.sessions.count
+                if self.started && self.sessions.isEmpty {
+                    self.status = self.castPlayer == nil ? "等待手机投屏" : "手机已断开 · 电视继续播放"
+                }
             }
         }, processor: { [weak self] session, frame in
             DispatchQueue.main.async {
-                self?.handleEvent(frame: frame, session: session)
+                guard let self, self.sessions.contains(session) else { return }
+                self.handleEvent(frame: frame, session: session)
             }
         })
 
@@ -105,9 +137,7 @@ class BiliBiliUpnpDMR: NSObject {
 
         httpServer.post["/AVTransport/action"] = {
             req in
-            let str = String(data: Data(req.body), encoding: .utf8) ?? ""
-            Logger.debug("handle AVTransport.xml \(str)")
-            return HttpResponse.ok(.text(str))
+            return HttpResponse.badRequest(.text("Use the Bilibili NVA projection service"))
         }
 
         httpServer["/AVTransport/event"] = {
@@ -115,18 +145,28 @@ class BiliBiliUpnpDMR: NSObject {
             return HttpResponse.internalServerError(nil)
         }
 
-        httpServer["/debug/log"] = {
-            req in
-            if let path = Logger.latestLogPath(),
-               let str = try? String(contentsOf: URL(fileURLWithPath: path))
-            {
-                return HttpResponse.ok(.text(str))
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            DispatchQueue.main.async {
+                guard let self, self.foreground, Settings.enableDLNA else { return }
+                if path.status != .satisfied {
+                    self.stop()
+                    self.status = "网络未连接 · 等待恢复"
+                } else if !self.started || self.ip != self.getIPAddress() {
+                    self.startIfNeed()
+                }
             }
-            return HttpResponse.internalServerError(nil)
         }
+        pathMonitor.start(queue: DispatchQueue(label: "living.cast.network"))
+        startIfNeed()
     }
 
-    func stop() {
+    @MainActor func stop() {
+        presentationTask?.cancel()
+        sessions.forEach { $0.close() }
+        sessions.removeAll()
+        connectedCount = 0
+        isRunning = false
+        status = Settings.enableDLNA ? "投屏已暂停" : "投屏已关闭"
         boardcastTimer?.invalidate()
         boardcastTimer = nil
         udp?.close()
@@ -135,46 +175,54 @@ class BiliBiliUpnpDMR: NSObject {
         Logger.info("dmr stopped")
     }
 
-    @objc func didEnterBackground() {
+    @MainActor @objc func didEnterBackground() {
+        foreground = false
         stop()
     }
 
-    @objc func willEnterForeground() {
+    @MainActor @objc func willEnterForeground() {
+        foreground = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             self.startIfNeed()
         }
     }
 
-    private func startIfNeed() {
+    @MainActor private func startIfNeed() {
+        guard Settings.enableDLNA, foreground else { stop(); return }
+        let address = getIPAddress()
+        if started && address == ip { return }
         stop()
-        guard Settings.enableDLNA else { return }
-        ip = getIPAddress()
+        ip = address
+        guard ip != nil else { status = "网络未连接 · 等待恢复"; return }
         do {
             udp = GCDAsyncUdpSocket(delegate: self, delegateQueue: udpQueue)
-            try? udp.enableBroadcast(true)
-            try? udp.enableReusePort(true)
-            try? udp.bind(toPort: ssdpPort)
-            try? udp.joinMulticastGroup(ssdpHost)
-            try? udp.beginReceiving()
+            try udp.enableBroadcast(true)
+            try udp.enableReusePort(true)
+            try udp.bind(toPort: ssdpPort)
+            try udp.joinMulticastGroup(ssdpHost)
+            try udp.beginReceiving()
             try httpServer.start(httpPort)
             started = true
+            isRunning = true
+            status = "等待手机投屏"
             Logger.info("dmr started, http: \(httpPort), ssdp: \(ssdpPort)")
         } catch let err {
             started = false
+            status = "投屏启动失败 · 请重试"
             udp?.close()
             udp = nil
             httpServer.stop()
             Logger.warn("dmr start fail: \(err.localizedDescription).")
             return
         }
-        boardcastTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) {
+        boardcastTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) {
             [weak self] _ in
             guard let self else { return }
             guard started else { return }
-            guard let notify = getSSDPNotify(),
-                  let data = notify.data(using: .utf8)
-            else { return }
-            udp.send(data, toHost: ssdpHost, port: ssdpPort, withTimeout: 1, tag: 0)
+            for type in discoveryTypes {
+                let data = Data(discoveryMessage(type: type, notify: true).utf8)
+                udp.send(data, toHost: ssdpHost, port: ssdpPort, withTimeout: 1, tag: 0)
+            }
         }
     }
 
@@ -204,44 +252,18 @@ class BiliBiliUpnpDMR: NSObject {
         return address
     }
 
-    private func getSSDPResp() -> String {
-        guard let ip = ip ?? getIPAddress() else {
-            Logger.debug("no ip")
-            return ""
-        }
-
-        return """
-        HTTP/1.1 200 OK
-        LOCATION: http://\(ip):\(httpPort)/description.xml
-        CACHE-CONTROL: max-age=30
-        SERVER: \(mockServerName)
-        EXT:
-        BOOTID.UPNP.ORG: 1669443520
-        CONFIGID.UPNP.ORG: 10177363
-        USN: uuid:atvbilibili&\(bUuid)::upnp:rootdevice
-        ST: upnp:rootdevice
-        DATE: \(ssdpDateString())
-
-        """
+    private var discoveryTypes: [String] {
+        ["upnp:rootdevice", "urn:schemas-upnp-org:device:MediaRenderer:1",
+         "urn:schemas-upnp-org:service:NirvanaControl:3", "urn:app-bilibili-com:service:NirvanaControl:3"]
     }
 
-    private func getSSDPNotify() -> String? {
-        guard let ip = ip ?? getIPAddress() else {
-            Logger.debug("no ip")
-            return nil
-        }
-        let text = """
-        NOTIFY * HTTP/1.1
-        Host: \(ssdpHost):\(ssdpPort)
-        Location: http://\(ip):9958/description.xml
-        Cache-Control: max-age=30
-        Server: \(mockServerName)
-        NTS: ssdp:alive
-        USN: uuid:\(bUuid)::urn:schemas-upnp-org:device:MediaRenderer:1
-        NT: urn:schemas-upnp-org:device:MediaRenderer:1
-
-        """
-        return text
+    func discoveryMessage(type: String, notify: Bool) -> String {
+        let location = "http://\(ip ?? "127.0.0.1"):\(httpPort)/description.xml"
+        var lines = notify ? ["NOTIFY * HTTP/1.1", "HOST: \(ssdpHost):\(ssdpPort)", "NTS: ssdp:alive", "NT: \(type)"]
+            : ["HTTP/1.1 200 OK", "EXT:", "ST: \(type)"]
+        lines += ["LOCATION: \(location)", "CACHE-CONTROL: max-age=60", "SERVER: \(mockServerName)",
+                  "USN: uuid:atvbilibili&\(bUuid)::\(type)", "DATE: \(ssdpDateString())", "", ""]
+        return lines.joined(separator: "\r\n")
     }
 
     private func ssdpDateString() -> String {
@@ -252,56 +274,53 @@ class BiliBiliUpnpDMR: NSObject {
         return formatter.string(from: Date())
     }
 
-    func handleEvent(frame: NVASession.NVAFrame, session: NVASession) {
-        let topMost = UIViewController.topMostViewController()
+    @MainActor func handleEvent(frame: NVASession.NVAFrame, session: NVASession) {
+        guard started else { return }
+        let json = JSON(parseJSON: frame.body)
         switch frame.action {
         case "GetVolume":
             session.sendReply(content: ["volume": 30])
-        case "Play":
-            handlePlay(json: JSON(parseJSON: frame.body))
-            session.sendEmpty()
+            return
+        case "Play", "PlayUrl":
+            do {
+                let content = try LivingCastRequest.content(action: frame.action, body: frame.body)
+                playVideo(request: try LivingCastRequest(json: content))
+            } catch { sendStatus(status: .stop); status = error.localizedDescription }
         case "Pause":
+            castContext?.paused = true
+            castPlayer?.autoPlayWhenReady = false
             currentPlugin?.pause()
-            session.sendEmpty()
         case "Resume":
+            castContext?.paused = false
+            castPlayer?.autoPlayWhenReady = true
             currentPlugin?.resume()
-            session.sendEmpty()
         case "SwitchDanmaku":
-            let json = JSON(parseJSON: frame.body)
-            Defaults.shared.showDanmu = json["open"].boolValue
-            session.sendEmpty()
-        case "Seek":
-            let json = JSON(parseJSON: frame.body)
-            currentPlugin?.seek(to: json["seekTs"].doubleValue)
-            session.sendEmpty()
-        case "Stop":
-            (topMost as? CommonPlayerViewController)?.dismiss(animated: true)
-            session.sendEmpty()
-        case "PlayUrl":
-            let json = JSON(parseJSON: frame.body)
-            session.sendEmpty()
-            guard let url = json["url"].url,
-                  let extStr = URLComponents(string: url.absoluteString)?.queryItems?
-                  .first(where: { $0.name == "nva_ext" })?.value
-            else {
-                Logger.warn("get play url: \(frame.body)")
-                return
+            if let open = json["open"].bool ?? Bool(json["open"].stringValue) {
+                Defaults.shared.showDanmu = open
+                sessions.forEach { $0.sendCommand(action: "OnDanmakuSwitch", content: ["open": open]) }
             }
-            let ext = JSON(parseJSON: extStr)
-            handlePlay(json: ext["content"])
-        default:
-            Logger.debug("action: \(frame.action)")
-            session.sendEmpty()
+        case "Seek":
+            if let seconds = LivingCastRequest.seconds(json["seekTs"]) {
+                if let currentPlugin { currentPlugin.seek(to: seconds) }
+                else { castContext?.pendingSeek = seconds }
+            }
+        case "Stop":
+            presentationTask?.cancel()
+            castContext = nil
+            currentPlugin = nil
+            castPlayer?.stopPlayback()
+            castPlayer?.dismiss(animated: true)
+            castPlayer = nil
+            sendStatus(status: .stop)
+        default: break
         }
+        session.sendEmpty()
     }
 
-    func handlePlay(json: JSON) {
-        let roomId = json["roomId"].stringValue
-        if roomId.count > 0, let room = Int(roomId), room > 0 {
-            playLive(roomID: room)
-        } else {
-            playVideo(json: json)
-        }
+    func attach(plugin: BUpnpPlugin, context: LivingCastContext) -> Bool {
+        guard castContext === context else { return false }
+        currentPlugin = plugin
+        return true
     }
 
     enum PlayStatus: Int {
@@ -313,11 +332,21 @@ class BiliBiliUpnpDMR: NSObject {
     }
 
     @MainActor func sendStatus(status: PlayStatus) {
-        Logger.debug("send status: \(status)")
+        lastStatus = status
+        if !sessions.isEmpty {
+            switch status {
+            case .loading: self.status = "正在接力播放…"
+            case .playing: self.status = "正在投屏"
+            case .paused: self.status = "投屏已暂停"
+            case .end, .stop: self.status = "手机已连接 · 等待投屏"
+            }
+        }
         Array(sessions).forEach { $0.sendCommand(action: "OnPlayState", content: ["playState": status.rawValue]) }
     }
 
     @MainActor func sendProgress(duration: Int, current: Int) {
+        lastDuration = duration
+        lastPosition = current
         Array(sessions).forEach { $0.sendCommand(action: "OnProgress", content: ["duration": duration, "position": current]) }
     }
 
@@ -343,30 +372,32 @@ class BiliBiliUpnpDMR: NSObject {
 }
 
 extension BiliBiliUpnpDMR {
-    func playLive(roomID: Int) {
-        let player = LivePlayerViewController()
-        player.room = LiveRoom(title: "", room_id: roomID, uname: "", area_v2_name: "", keyframe: nil, face: nil, cover_from_user: nil)
-        UIViewController.topMostViewController().present(player, animated: true)
-    }
-
-    func playVideo(json: JSON) {
-        let aid = json["aid"].intValue
-        let cid = json["cid"].intValue
-        let epid = json["epid"].intValue
-
-        let player: VideoDetailViewController
-        if epid > 0 {
-            player = VideoDetailViewController.create(epid: epid)
-        } else {
-            player = VideoDetailViewController.create(aid: aid, cid: cid)
-        }
-        let topMost = UIViewController.topMostViewController()
-        if let _ = AppDelegate.shared.window!.rootViewController?.presentedViewController {
-            AppDelegate.shared.window!.rootViewController?.dismiss(animated: false) {
-                player.present(from: UIViewController.topMostViewController(), direatlyEnterVideo: true)
+    @MainActor func playVideo(request: LivingCastRequest) {
+        presentationTask?.cancel()
+        currentPlugin = nil
+        let context = LivingCastContext()
+        castContext = context
+        lastDuration = 0
+        lastPosition = request.position
+        sendStatus(status: .loading)
+        presentationTask = Task { @MainActor [weak self] in
+            guard let self, let root = AppDelegate.shared.window?.rootViewController else { return }
+            if let presented = root.presentedViewController {
+                (presented as? CommonPlayerViewController)?.stopPlayback()
+                await withCheckedContinuation { continuation in
+                    root.dismiss(animated: false) { continuation.resume() }
+                }
             }
-        } else {
-            player.present(from: topMost, direatlyEnterVideo: true)
+            guard !Task.isCancelled, self.castContext === context else { return }
+            let player = VideoPlayerViewController(playInfo: request.playInfo, startTimeOverride: request.position, castContext: context)
+            player.autoPlayWhenReady = !context.paused
+            player.onLoadFailure = { [weak self, weak context] message in
+                guard let self, let context, self.castContext === context else { return }
+                self.sendStatus(status: .stop)
+                self.status = "投屏失败：\(message)"
+            }
+            self.castPlayer = player
+            root.present(player, animated: true)
         }
     }
 }
@@ -383,11 +414,16 @@ extension BiliBiliUpnpDMR: GCDAsyncUdpSocketDelegate {
         }
         var ipAddress = String(cString: hostname)
         ipAddress = ipAddress.replacingOccurrences(of: "::ffff:", with: "")
-        let str = String(data: data, encoding: .utf8)
-        if str?.contains("ssdp:discover") == true {
-            Logger.debug("handle ssdp discover from: \(ipAddress)")
-            let data = getSSDPResp().data(using: .utf8)!
-            sock.send(data, toAddress: address, withTimeout: -1, tag: 0)
+        guard let str = String(data: data, encoding: .utf8),
+              str.uppercased().hasPrefix("M-SEARCH "), str.lowercased().contains("ssdp:discover") else { return }
+        let target = str.components(separatedBy: "\n").first { $0.uppercased().hasPrefix("ST:") }?
+            .dropFirst(3).trimmingCharacters(in: .whitespacesAndNewlines) ?? "ssdp:all"
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.started else { return }
+            let types = target == "ssdp:all" ? self.discoveryTypes : self.discoveryTypes.filter { $0 == target }
+            for type in types {
+                sock.send(Data(self.discoveryMessage(type: type, notify: false).utf8), toAddress: address, withTimeout: 1, tag: 0)
+            }
         }
     }
 }

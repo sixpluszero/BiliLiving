@@ -119,6 +119,7 @@ struct LivingLibraryView: View {
     @ObservedObject private var defaults = Defaults.shared
     @State private var loggedIn = ApiRequest.isLogin()
     var body: some View {
+        ScrollView {
         VStack(alignment: .leading, spacing: 44) {
             HStack(spacing: 28) {
                 Image(systemName: loggedIn ? "person.crop.circle.fill" : "person.crop.circle").font(.system(size: 80)).foregroundStyle(.white.opacity(0.75))
@@ -136,6 +137,7 @@ struct LivingLibraryView: View {
                     Button { open(.toView) } label: { Label("稍后再看", systemImage: "bookmark") }
                 }
             }
+            LivingCastView()
             Divider().padding(.vertical, 10)
             Text("观看偏好").font(.system(size: 32, weight: .bold))
             HStack(spacing: 28) {
@@ -152,6 +154,7 @@ struct LivingLibraryView: View {
                 .lineLimit(3).fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
             Spacer()
             Text("BiliLiving · 为大屏而生").font(.system(size: 20)).foregroundStyle(.tertiary)
-        }.padding(.horizontal, 100).padding(.top, 90).padding(.bottom, 60).frame(maxWidth: .infinity, alignment: .leading).background(Color(white: 0.035))
+        }.padding(.horizontal, 100).padding(.top, 60).padding(.bottom, 60).frame(maxWidth: .infinity, alignment: .leading)
+        }.background(Color(white: 0.035))
     }
 }

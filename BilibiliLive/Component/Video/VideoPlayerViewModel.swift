@@ -39,6 +39,7 @@ class VideoPlayerViewModel {
     private let playContextCache: PlayContextCache?
     private let mediaWarmupManager: PlayerMediaWarmupManager?
     private let previewMuted: Bool
+    private let castContext: LivingCastContext?
     private let startTimeOverride: Int?
     private let startTimeOverrideContentIdentity: String
     private var videoDetail: VideoDetail?
@@ -51,8 +52,10 @@ class VideoPlayerViewModel {
          playContextCache: PlayContextCache? = nil,
          mediaWarmupManager: PlayerMediaWarmupManager? = nil,
          previewMuted: Bool = true,
-         startTimeOverride: Int? = nil)
+         startTimeOverride: Int? = nil,
+         castContext: LivingCastContext? = nil)
     {
+        self.castContext = castContext
         self.playInfo = playInfo
         self.playMode = playMode
         self.playContextCache = playContextCache
@@ -225,10 +228,9 @@ class VideoPlayerViewModel {
                                         playInfo: PlayInfo) -> Int?
     {
         if let startTimeOverride,
-           startTimeOverrideContentIdentity == playInfo.contentIdentity,
-           duration - startTimeOverride > 5
+           startTimeOverrideContentIdentity == playInfo.contentIdentity
         {
-            return startTimeOverride
+            return min(max(0, startTimeOverride), max(0, duration - 1))
         }
         if lastPlayCid == cid,
            duration - playTimeInSecond > 5,
@@ -302,7 +304,7 @@ class VideoPlayerViewModel {
         }
 
         let danmu = DanmuViewPlugin(provider: danmuProvider)
-        let upnp = BUpnpPlugin(duration: data.detail?.View.duration)
+        let upnp = BUpnpPlugin(duration: data.videoPlayURLInfo.dash.duration, context: castContext)
         let debug = DebugPlugin()
         debug.additionDebugInfo = { [weak playplugin] in
             playplugin?.networkDebugInfo ?? ""
