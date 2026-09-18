@@ -1,6 +1,6 @@
 # BiliLiving
 
-一个为客厅设计的 B 站 tvOS 客户端。基于 [ATV-Bilibili-demo](https://github.com/yichengchen/ATV-Bilibili-demo) 开发，保留原项目版权与 GPL-2.0 许可证。上游版本见 `docs/UPSTREAM-COMMIT`。
+一个为客厅设计的 B 站 tvOS 客户端，是 [ATV-Bilibili-demo](https://github.com/yichengchen/ATV-Bilibili-demo) 的衍生版本，重点改进游客浏览、客厅首页和手机投屏体验。保留原项目版权与 GPL-2.0 许可证。上游版本见 `docs/UPSTREAM-COMMIT`。
 
 ## 功能
 
@@ -50,4 +50,6 @@
 
 ## 来源
 
-原始 README 位于 [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md)，许可证位于 [LICENSE.md](LICENSE.md)。本地分支 `feature/bililiving`。Swift Package Manager 依赖解析结果随项目记录。品牌图标由 `scripts/generate-brand.swift` 绘制。
+项目仓库：[sixpluszero/BiliLiving](https://github.com/sixpluszero/BiliLiving)，默认分支为 `main`。
+
+播放器、B 站接口、弹幕、账号和投屏基础来自 ATV-Bilibili-demo 及其贡献者；BiliLiving 在此基础上进行定制开发。原始 README 位于 [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md)，许可证位于 [LICENSE.md](LICENSE.md)。Swift Package Manager 依赖解析结果随项目记录。品牌图标由 `scripts/generate-brand.swift` 绘制。
