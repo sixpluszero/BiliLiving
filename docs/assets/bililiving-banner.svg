@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="240" viewBox="0 0 960 240" role="img" aria-labelledby="title desc">
+  <title id="title">BiliLiving</title>
+  <desc id="desc">A television play icon beside the BiliLiving wordmark on a dark blue background.</desc>
+  <defs>
+    <linearGradient id="background" x2="1" y2="1">
+      <stop stop-color="#1f3045"/>
+      <stop offset="1" stop-color="#090d14"/>
+    </linearGradient>
+  </defs>
+  <rect width="960" height="240" rx="24" fill="url(#background)"/>
+  <rect x="154" y="69" width="142" height="98" rx="21" fill="#ffffff" fill-opacity=".08" stroke="#d8e5f2" stroke-width="3"/>
+  <path d="M213 95 L246 118 L213 141 Z" fill="#ffffff"/>
+  <text x="338" y="93" fill="#94b6d2" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="13" font-weight="600" letter-spacing="4">YOUR LIVING ROOM. ON PLAY.</text>
+  <text x="333" y="155" fill="#ffffff" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="62" font-weight="650" letter-spacing="-2">BiliLiving</text>
+</svg>
