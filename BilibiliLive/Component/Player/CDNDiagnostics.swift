@@ -19,6 +19,12 @@ enum CDNDiagnostics {
         /// DNS + 建连 + TLS + 首字节等待，跨境链路的高 RTT 主要体现在这里
         let setupTime: TimeInterval
         let error: String?
+        let totalTime: TimeInterval
+
+        var endToEndMbps: Double? {
+            guard error == nil, totalTime > 0, bytes > 0 else { return nil }
+            return Double(bytes) * 8 / totalTime / 1_000_000
+        }
 
         var host: String {
             URLComponents(string: url)?.host ?? "unknown"
@@ -70,7 +76,7 @@ enum CDNDiagnostics {
         let ranked = results.sorted { ($0.mbps ?? -1) > ($1.mbps ?? -1) }
         let summary = ranked.map { r in
             let speed = r.mbps.map { String(format: "%.1fMbps", $0) } ?? "失败"
-            return "\(r.host)=\(speed)"
+            return "\(r.host)=body:\(speed), total:\(r.endToEndMbps.map { String(format: "%.1fMbps", $0) } ?? "失败")"
         }.joined(separator: ", ")
         Logger.info("[cdn] 起播轻量测速 (\(quickProbeBytes / 1024)KB): \(summary)")
         return ranked.first(where: { $0.mbps != nil })?.host
@@ -95,13 +101,15 @@ enum CDNDiagnostics {
     }
 
     private static func probe(url: String, bytes: Int, session: Session) async -> ProbeResult {
+        let started = ProcessInfo.processInfo.systemUptime
         let response = await session.request(url, headers: [
             "Range": "bytes=0-\(bytes - 1)",
             "Referer": Keys.referer,
         ]).serializingData().response
 
         var setupTime: TimeInterval = 0
-        var transferTime = response.metrics?.taskInterval.duration ?? 0
+        let totalTime = response.metrics?.taskInterval.duration ?? (ProcessInfo.processInfo.systemUptime - started)
+        var transferTime: TimeInterval = 0
         if let metrics = response.metrics?.transactionMetrics.last,
            let fetchStart = metrics.fetchStartDate,
            let responseStart = metrics.responseStartDate,
@@ -111,15 +119,26 @@ enum CDNDiagnostics {
             transferTime = responseEnd.timeIntervalSince(responseStart)
         }
 
-        switch response.result {
-        case let .success(data):
-            return ProbeResult(url: url, bytes: data.count,
-                               transferTime: transferTime, setupTime: setupTime, error: nil)
-        case let .failure(error):
-            return ProbeResult(url: url, bytes: 0,
-                               transferTime: transferTime, setupTime: setupTime,
-                               error: error.localizedDescription)
-        }
+        let status = response.response?.statusCode
+        let count = response.data?.count ?? 0
+        let range = response.response?.value(forHTTPHeaderField: "Content-Range")
+        let failure = response.error.map { PlaybackDiagnostics.error($0) }
+            ?? probeResponseFailure(status: status, contentRange: range, receivedBytes: count, requestedBytes: bytes)
+        let result = ProbeResult(url: url, bytes: count, transferTime: transferTime,
+                                 setupTime: setupTime, error: failure, totalTime: totalTime)
+        Logger.info("[cdn-probe] resource=\(PlaybackDiagnostics.resource(url)) status=\(status ?? -1) requested=\(bytes) received=\(count) contentRange=\(PlaybackDiagnostics.sanitize(range ?? "-")) bodyMbps=\(result.mbps ?? -1) totalMbps=\(result.endToEndMbps ?? -1) \(PlaybackDiagnostics.networkMetrics(response.metrics)) error=\(failure ?? "none")")
+        return result
+    }
+
+    // A fast HTTP error page or an ignored Range must not win CDN selection.
+    static func probeResponseFailure(status: Int?, contentRange: String?, receivedBytes: Int, requestedBytes: Int) -> String? {
+        guard status == 206 else { return "expected HTTP 206, got \(status ?? -1)" }
+        guard receivedBytes > 0, receivedBytes <= requestedBytes,
+              let contentRange, contentRange.hasPrefix("bytes 0-"),
+              let end = Int(contentRange.dropFirst(8).split(separator: "/").first ?? ""),
+              end == receivedBytes - 1,
+              receivedBytes == requestedBytes || Int(contentRange.split(separator: "/").last ?? "") == receivedBytes else { return "invalid or incomplete Range response" }
+        return nil
     }
 
     private static func report(_ results: [ProbeResult], currentHost: String?, probeBytes: Int) -> String {
@@ -128,7 +147,7 @@ enum CDNDiagnostics {
         for (index, result) in ranked.enumerated() {
             let speed = result.mbps.map { String(format: "%.1f Mbps", $0) } ?? "失败"
             let setup = String(format: "%.0fms", result.setupTime * 1000)
-            var line = "\(index + 1). \(speed)  setup \(setup)  \(result.host)"
+            var line = "\(index + 1). body \(speed) total \(result.endToEndMbps.map { String(format: "%.1f Mbps", $0) } ?? "失败") setup \(setup)  \(result.host)"
             if result.isPCDN {
                 line += "  PCDN"
             }

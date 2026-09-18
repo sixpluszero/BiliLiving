@@ -6,6 +6,34 @@ import CocoaAsyncSocket
 @testable import BilibiliLive
 
 final class BiliLivingTests: XCTestCase {
+    func testPlaybackDiagnosticsRedactsSignedURLsAndPreservesErrorChain() {
+        let url = "https://user:password@cdn.example/video.m4s?token=secret&deadline=123#fragment"
+        XCTAssertEqual(PlaybackDiagnostics.resource(url), "https://cdn.example/video.m4s")
+        let underlying = NSError(domain: NSURLErrorDomain, code: -1001,
+                                 userInfo: [NSLocalizedDescriptionKey: "timeout \(url)"])
+        let error = NSError(domain: "AVFoundationErrorDomain", code: -11800,
+                            userInfo: [NSUnderlyingErrorKey: underlying])
+        let logged = PlaybackDiagnostics.error(error)
+        XCTAssertTrue(logged.contains("-11800"))
+        XCTAssertTrue(logged.contains("-1001"))
+        XCTAssertTrue(logged.contains("cdn.example/video.m4s"))
+        XCTAssertFalse(logged.contains("secret"))
+        XCTAssertFalse(logged.contains("password"))
+        XCTAssertFalse(logged.contains("deadline"))
+    }
+
+    func testCDNProbeRejectsHTTPErrorAndInvalidRanges() {
+        XCTAssertNil(CDNDiagnostics.probeResponseFailure(status: 206, contentRange: "bytes 0-262143/1000000", receivedBytes: 262144, requestedBytes: 262144))
+        XCTAssertNotNil(CDNDiagnostics.probeResponseFailure(status: 403, contentRange: nil, receivedBytes: 100, requestedBytes: 262144))
+        XCTAssertNotNil(CDNDiagnostics.probeResponseFailure(status: 200, contentRange: nil, receivedBytes: 262144, requestedBytes: 262144))
+        XCTAssertNotNil(CDNDiagnostics.probeResponseFailure(status: 206, contentRange: "bytes 100-199/1000", receivedBytes: 100, requestedBytes: 262144))
+        XCTAssertNotNil(CDNDiagnostics.probeResponseFailure(status: 206, contentRange: "bytes 0-262143/1000000", receivedBytes: 100, requestedBytes: 262144))
+        let result = CDNDiagnostics.ProbeResult(url: "https://cdn.example/video", bytes: 262144,
+                                               transferTime: 0.02, setupTime: 1, error: nil, totalTime: 1.02)
+        XCTAssertEqual(result.mbps ?? 0, 104.8576, accuracy: 0.001)
+        XCTAssertEqual(result.endToEndMbps ?? 0, 2.056, accuracy: 0.001)
+    }
+
     func testDefaultNavigationAndQualityPolicy() {
         XCTAssertEqual(TabBarPage.defaultTabBarPages, [.feed, .search, .personal])
         XCTAssertEqual(MediaQualityEnum.quality_1080p.qn, 80)

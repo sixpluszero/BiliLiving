@@ -48,6 +48,7 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
     private var hasSubtitle = false
     private var hasPreferSubtitleAdded = false
     private var httpServer = HttpServer()
+    let diagnosticID = String(UUID().uuidString.prefix(8))
     private var aid = 0
     private(set) var httpPort = 0
     private(set) var isHDR = false
@@ -184,6 +185,7 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
               let sidxResult = sidxResult
         else {
             currentSegmentHost = URLComponents(string: info.url)?.host
+            Logger.warn("[media-map] id=\(diagnosticID) aid=\(aid) qn=\(info.info.id) codec=\(info.info.codecs) sidx-unavailable; falling back to whole-file duration=\(info.duration) resource=\(PlaybackDiagnostics.resource(info.url))")
             return """
             #EXTM3U
             #EXT-X-VERSION:7
@@ -201,6 +203,7 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         // 首选 CDN 挂掉时 segment 会整体切到探测成功的备用 URL
         let segment = sidxResult.sidx
         let segmentURL = sidxResult.url
+        Logger.info("[media-map] id=\(diagnosticID) aid=\(aid) qn=\(info.info.id) codec=\(info.info.codecs) size=\(info.info.width ?? 0)x\(info.info.height ?? 0) preferredHost=\(preferredHost ?? "-") actualResource=\(PlaybackDiagnostics.resource(segmentURL)) segments=\(segment.segments.count) maxSegmentSeconds=\(segment.maxSegmentDuration() ?? 0) bandwidth=\(info.info.bandwidth)")
         if (info.info.width ?? 0) > 0 {
             currentSegmentHost = URLComponents(string: segmentURL)?.host
         }
@@ -391,6 +394,7 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
     func selectPreferredCDNIfNeeded() async {
         guard preferredHost == nil else { return }
         preferredHost = await CDNDiagnostics.pickFastestHost(urls: cdnCandidates)
+        Logger.info("[cdn-selected] id=\(diagnosticID) aid=\(aid) host=\(preferredHost ?? "none") probe=first-video-256KB")
     }
 
     func prewarmPrimaryVideoIndex() async {
@@ -439,7 +443,7 @@ private extension BilibiliVideoResourceLoaderDelegate {
             return
         }
         let urlStr = customUrl.absoluteString
-        Logger.debug("handleCustomPlaylistRequest: \(urlStr)")
+        Logger.debug("handleCustomPlaylistRequest id=\(diagnosticID): \(PlaybackDiagnostics.resource(urlStr))")
         if urlStr == URLs.play {
             report(loadingRequest, content: masterPlaylist)
             return
@@ -666,20 +670,20 @@ actor SidxDownloader {
         }
         for url in urls.prefix(3) {
             guard !Task.isCancelled else { return nil }
-            let host = URLComponents(string: url)?.host ?? url
+            let host = URLComponents(string: url)?.host ?? "-"
             let start = Date()
-            if let res = try? await Self.session.request(url,
-                                                         headers: ["Range": "bytes=\(range)",
-                                                                   "Referer": "https://www.bilibili.com/"])
-                .serializingData().result.get(),
-                !Task.isCancelled,
-                let segment = SidxParseUtil.processIndexData(data: res),
-                !segment.segments.isEmpty
-            {
-                Logger.info("sidx ok in \(elapsedMs(since: start))ms from \(host)")
+            Logger.info("[sidx-request] qn=\(info.id) codec=\(info.codecs) host=\(host) range=\(range)")
+            let response = await Self.session.request(url,
+                headers: ["Range": "bytes=\(range)", "Referer": "https://www.bilibili.com/"])
+                .validate(statusCode: [206])
+                .serializingData().response
+            guard !Task.isCancelled else { return nil }
+            Logger.info("[sidx-response] qn=\(info.id) codec=\(info.codecs) host=\(host) status=\(response.response?.statusCode ?? -1) bytes=\(response.data?.count ?? 0) elapsedMs=\(elapsedMs(since: start)) \(PlaybackDiagnostics.networkMetrics(response.metrics)) error=\(PlaybackDiagnostics.error(response.error))")
+            if response.error == nil, let data = response.data,
+               let segment = SidxParseUtil.processIndexData(data: data), !segment.segments.isEmpty {
                 return SidxResult(sidx: segment, url: url)
             }
-            Logger.warn("sidx download failed in \(elapsedMs(since: start))ms on \(host), try next url")
+            Logger.warn("[sidx-failed] qn=\(info.id) codec=\(info.codecs) host=\(host) reason=\(response.error == nil ? "invalid-or-empty-index" : "http-or-transport-error") try-next-url")
         }
         return nil
     }

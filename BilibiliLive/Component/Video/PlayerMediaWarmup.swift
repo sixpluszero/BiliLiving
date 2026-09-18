@@ -34,6 +34,12 @@ enum PlayerMediaFactory {
         ]
         let asset = AVURLAsset(url: playURL, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
         let delegate = BilibiliVideoResourceLoaderDelegate()
+        let started = ProcessInfo.processInfo.systemUptime
+        var stage = "manifest"
+        defer {
+            Logger.info("[media-prepare] id=\(delegate.diagnosticID) aid=\(aid) asset=\(ObjectIdentifier(asset)) lastStage=\(stage) elapsed=\(ProcessInfo.processInfo.systemUptime - started)s cancelled=\(Task.isCancelled)")
+        }
+        Logger.info("[media-prepare] id=\(delegate.diagnosticID) aid=\(aid) asset=\(ObjectIdentifier(asset)) begin quality=\(preferences.quality.qn) maxQuality=\(maxQuality ?? 0) streamIndex=\(streamIndex ?? -1)")
         delegate.setBilibili(info: urlInfo,
                              subtitles: playerInfo?.subtitle?.subtitles ?? [],
                              aid: aid,
@@ -43,21 +49,27 @@ enum PlayerMediaFactory {
                              preferences: preferences)
         // Warmed/sequence playback also needs throughput selection; preparing
         // only SIDX measures latency and used to bypass the normal CDN probe.
+        stage = "cdn-probe"
         await delegate.selectPreferredCDNIfNeeded()
         try Task.checkCancellation()
         asset.resourceLoader.setDelegate(delegate, queue: DispatchQueue(label: "loader.\(aid).\(UUID().uuidString)"))
         try Task.checkCancellation()
+        stage = "asset-isPlayable"
+        Logger.info("[media-prepare] id=\(delegate.diagnosticID) stage=\(stage) elapsed=\(ProcessInfo.processInfo.systemUptime - started)s")
         let playable = try await asset.load(.isPlayable)
         try Task.checkCancellation()
         guard playable else {
             throw "加载资源失败"
         }
+        stage = "sidx-prewarm"
+        Logger.info("[media-prepare] id=\(delegate.diagnosticID) stage=\(stage) elapsed=\(ProcessInfo.processInfo.systemUptime - started)s")
         try await withTaskCancellationHandler {
             await delegate.prewarmPrimaryVideoIndex()
             try Task.checkCancellation()
         } onCancel: {
             delegate.cancelPendingIndexLoads()
         }
+        stage = "prepared"
         return PreparedPlayerMedia(asset: asset, delegate: delegate)
     }
 }

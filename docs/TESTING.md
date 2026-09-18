@@ -173,3 +173,13 @@ tvOS Release 无签名构建通过，产物 `build/artifacts/BiliLiving-personal
 模拟器的真实播放测试未验证会员 4K；电视上的实际 4K 起播及真实账号关注/取消关注仍需手测。此次没有重跑无关的投屏组播测试。
 
 tvOS Release 无签名构建通过，产物 `build/artifacts/BiliLiving-quality-follow-20260915.ipa` 已完成 ZIP 完整性检查。
+
+## 起播/CDN 诊断（2026-09-17）
+
+新增从播放器安装开始的周期/状态日志、首帧准备状态、底层错误链和 AVPlayer access/error 记录；测速同时记录正文和完整任务吞吐、网络阶段及 HTTP/Range 验证，资源映射记录音视频真实 CDN。详见 [诊断字段与限制](PLAYBACK-BUFFERING.md#起播诊断日志2026-09-17)。
+
+最终专项结果 `build/Playback-Diagnostics-Display-20260917.xcresult`：**3 项通过，0 失败**（9.269 秒）。验证签名 URL 脱敏及 NSError 错误链、403/忽略 Range/截断响应拒绝和测速口径计算、真实 B 站视频起播/缓冲/切画质/暂停/恢复。运行输出确认日志在 item preparing、rate=0 时已经产生，并收到 display-ready、系统缓冲等待及 CoreMediaErrorDomain -12318 的真实记录。该带宽声明警告出现在成功播放中，不能单独据此认定真机故障根因。
+
+同一轮排查的真实测速样本出现正文约 54 Mbps 而含等待约 13 Mbps，以及复用连接后正文约 796 Mbps 的短时值，说明只测 256 KB 正文会高估持续传输能力；未复现真机原始近三分钟等待，不宣称该问题已修复。本次未重跑无关投屏发现测试。
+
+tvOS Release 无签名构建通过，诊断包 `build/artifacts/BiliLiving-playback-diagnostics-20260917.ipa` 已通过 ZIP 完整性校验。未安装到客厅 Apple TV，真机起播故障需在此版本复现后读取日志。

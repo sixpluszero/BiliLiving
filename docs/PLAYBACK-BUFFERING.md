@@ -27,3 +27,18 @@
 ## 旧版真机日志证据
 
 从用户已连接的客厅 Apple TV 读取到的旧版日志中，20:44:16–20:44:31 的前向缓存依次约为 11.8、7.1、2.5、0.2 秒，最后进入等待缓冲；之后多次重复。与此同时短测速显示数百 Mbps，但真实播放器吞吐明显更低，因此短测速结果不能代替持续播放验证。日志原件仅保留在本机临时目录，未加入仓库（可能含签名 URL）。
+
+## 起播诊断日志（2026-09-17）
+
+针对真机 22:44 的 4K 视频长时间起播等待，新增以下日志。旧日志中 103.7 Mbps 是 256 KB 请求收到首字节之后的正文吞吐，不包括首字节等待；不能与 AVPlayer 的 observedBitrate 直接比较，也不足以确定此前约三分钟等待的根因。
+
+- `[media-prepare]`：媒体准备的 manifest、CDN probe、asset.isPlayable、SIDX prewarm 阶段及耗时，包含 aid、画质和 asset 标识。
+- `[cdn-probe]`：请求资源（移除签名查询参数）、HTTP 状态、Range/字节数、正文 Mbps、完整任务 Mbps；DNS、连接、TLS、首字节、正文耗时，以及协议、连接复用、代理、缓存来源类型和重定向。拒绝将非 206 或不完整 Range 响应当成成功测速。测速仍按正文吞吐选源，暂不调整正常画质策略。
+- `[cdn-selected]` / `[media-map]`：候选测速选中的 host、各音视频轨道最终生成分片列表时使用的真实 CDN 和资源路径、编码、分辨率、声明码率、分片数量与最长时长。SIDX 失败而退回整文件播放会单独警告。测速只取首个视频编码，不能代替其他编码/音频资源的实际测速。
+- `[sidx-request]` / `[sidx-response]` / `[sidx-failed]`：每次索引请求、HTTP/网络错误和耗时，区分 HTTP/传输失败与索引解析失败。
+- `[playback-diag]`：从 AVPlayer 安装即开始，每 5 秒和状态变化时记录，包含尚未 ready 的起播阶段；记录 item/timeControl 状态、首帧准备状态 displayReady、系统等待原因、rate、位置、缓冲区间与目标、keepUp/empty/full、底层错误链。paused 只表示暂停或尚未请求播放，不推断为用户主动暂停。
+- `[playback-access]` / `[playback-error]`：AVPlayer 实际访问/错误日志中的资源、服务器 IP、吞吐、传输字节与时间、媒体请求数、已下载时长、startupTime、卡顿/丢帧和 CoreMedia/HTTP 错误。内部 atv:// URI 不代表真实 CDN，请结合 media-map 和错误资源定位。
+
+关联方式：media-prepare 与 media-map 共享媒体 id；media-prepare 的 asset 标识与 playback-diag attached 对应，后续播放器日志按播放器 id 聚合。切画质会产生新的媒体及播放器 id。退出/替换播放器时移除观察者与定时器。诊断写入现有滚动文件日志，Release 也启用；不需要开启画面上的 Debug 浮层。新增日志不输出 Cookie、签名 URL 查询或完整 HTTP headers。
+
+判读时先区分 `preparing`、`waiting`、`paused` 和 `failed`，再结合缓冲变化、系统等待原因及错误。hint 是状态提示，不是已证实的网络根因；firstObservedClockAdvance 仅为 5 秒采样观察到时钟前进，seek 也可能移动时钟，不等于首帧渲染时间。AVPlayer 的公开日志不提供每个媒体分片的 DNS/TTFB，精确网络分阶段耗时仅覆盖应用自己的测速/SIDX 请求。未复现前不能声称已确定原始三分钟等待的原因。
