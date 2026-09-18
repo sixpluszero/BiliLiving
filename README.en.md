@@ -26,7 +26,7 @@
 
 ---
 
-**BiliLiving** brings browsing, search, danmaku (on-screen comments), and phone casting to Apple TV. Start watching as a guest, or sign in for account recommendations, favorites, and watch history—all navigable with your remote.
+**BiliLiving** brings browsing, search, danmaku (on-screen comments), and phone casting to Apple TV, with a focus on **longer buffering for high-quality playback in the US and other overseas regions** and **TV-side HD playback from low-resolution cast links**. Start watching as a guest, or sign in for account recommendations, favorites, and watch history—all navigable with your remote.
 
 > A community fork of [ATV-Bilibili-demo](https://github.com/yichengchen/ATV-Bilibili-demo), focused on guest access, the living-room home screen, and casting. Core playback, API, and danmaku capabilities come from upstream. This is an unofficial Bilibili client.
 
@@ -43,6 +43,8 @@ See the [testing notes](docs/TESTING.md) (Chinese) for implementation and verifi
 
 | | What you can do on your TV |
 | :--- | :--- |
+| 🌎 **More buffering for overseas viewing** | New 30-second, 2-minute, and 5-minute forward-buffer targets, defaulting to 2 minutes, give 4K and other high-bitrate videos more room to absorb network fluctuations when accessing Bilibili CDNs from the US and other overseas regions. |
+| 📺 **Low-resolution cast, higher-quality TV playback** | When a phone sends only a plain DLNA 720p link, try to identify the original video and fetch available HD streams using the signed-in TV account, restoring quality controls and danmaku. |
 | 🛋 **Watch right away** | Browse, search, play videos, and enjoy danmaku without signing in. Account actions such as favoriting and following prompt for login when needed. |
 | 🎞 **A home screen for the couch** | Large artwork, a three-column video grid, and remote focus navigation. Signed-in viewers get account recommendations; guests get popular videos, with pagination and refresh. |
 | 🔎 **Native search** | Type with the tvOS keyboard or use Siri Remote dictation, subject to device language, region, and settings. |
@@ -50,6 +52,22 @@ See the [testing notes](docs/TESTING.md) (Chinese) for implementation and verifi
 | 💬 **Danmaku included** | Real video comments, enabled by default in the upper half of the screen, with in-player visibility and display controls. |
 | 📱 **Pick on your phone, watch on TV** | Receive casts from the Bilibili mobile app, resume at the supplied position, and pause, play, or seek from your phone. TV playback continues after the phone disconnects. |
 | 🔐 **Your viewing space** | QR-code login, favorites, history, Watch Later, and creator follows. Tokens and account cookies are stored in the device Keychain. |
+
+### 4K and high-bitrate playback improvements for overseas networks
+
+Upstream already supports 4K, CDN probing, and switching CDNs when playback stalls. BiliLiving builds on that foundation by replacing the fixed 15-second forward-buffer target for regular continuous video playback with **30 seconds, 2 minutes, or 5 minutes**, defaulting to **2 minutes**. The extra buffer is intended to absorb brief throughput drops on cross-border connections, helping viewers in the US and other overseas regions avoid repeated buffering during high-bitrate playback.
+
+- Adjust the target immediately under **播放设置 → 视频预缓冲** (Playback Settings → Video Buffer) in the player. Try 5 minutes on more variable connections.
+- Startup and seeking temporarily use a shorter buffer before restoring the longer target. Playback does not wait for the full 2 or 5 minutes to download.
+- A new “Best available” default and playlists limited to the selected quality reduce automatic downgrades after choosing a quality such as 4K.
+
+These durations are targets requested from AVPlayer. Actual buffering depends on the system and network; sustained insufficient bandwidth can still cause stalls. See the [buffering strategy](docs/PLAYBACK-BUFFERING.md) (Chinese) for implementation and validation limits.
+
+### Recover HD playback from a low-resolution phone cast link
+
+Upstream already supports fetching streams for casts that include video identifiers. BiliLiving adds a path for a different case: **the phone sends only a plain DLNA media URL, without an AV/BV identifier**. The TV extracts a CID from a trusted Bilibili URL, searches using the title, and verifies an exact CID match against Bilibili's video-part data. If the match succeeds and the TV is signed in, it opens the native player and fetches fresh streams.
+
+Even if the phone's cast controls only show 720p, the TV can request server-authorized 1080p/4K options using its own account, along with danmaku and playback settings. **Available quality depends on the TV account's permissions, the source video, and the server response; this does not bypass membership requirements.** Guests and unsuccessful matches retain the original phone-provided link, avoiding the wrong video or a downgrade of the existing stream. See the [casting guide](docs/CASTING.md) (Chinese).
 
 <a id="preview"></a>
 
