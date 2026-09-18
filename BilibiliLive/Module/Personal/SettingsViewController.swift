@@ -183,7 +183,7 @@ class SettingsViewController: UIViewController {
                 {
                     Settings.videoBufferDuration = $0
                 }
-                Actions(title: "最高画质", message: "4k以上需要大会员",
+                Actions(title: "默认画质", message: "最佳可用会选择片源和当前账号可用的最高画质；指定画质不可用时选择下一档。下次播放生效。",
                         current: Settings.mediaQuality.desp,
                         options: MediaQualityEnum.allCases,
                         optionString: MediaQualityEnum.allCases.map({ $0.desp }))

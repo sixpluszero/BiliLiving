@@ -644,6 +644,11 @@ extension WebRequest {
         requestJSON(method: .post, url: "https://api.bilibili.com/x/relation/modify", parameters: ["fid": mid, "act": follow ? 1 : 2, "re_src": 14])
     }
 
+    static func requestFollow(mid: Int, follow: Bool) async throws {
+        _ = try await requestJSON(method: .post, url: "https://api.bilibili.com/x/relation/modify",
+                                  parameters: ["fid": mid, "act": follow ? 1 : 2, "re_src": 14])
+    }
+
     static func block(mid: Int, block: Bool, complete: ((Result<JSON, RequestError>) -> Void)? = nil) {
         requestJSON(method: .post, url: "https://api.bilibili.com/x/relation/modify", parameters: ["fid": mid, "act": block ? 5 : 6, "re_src": 14], complete: complete)
     }
@@ -665,6 +670,8 @@ extension WebRequest {
     struct UpSpaceRelation: Codable, Hashable {
         // 0：未关注 1：悄悄关注（已弃用）2：已关注 6：已互粉 128：已拉黑
         let attribute: Int
+
+        var isFollowing: Bool { [1, 2, 6].contains(attribute) }
 
         var is_blocked: Bool {
             return attribute == 128

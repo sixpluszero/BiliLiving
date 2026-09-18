@@ -318,67 +318,16 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         playlists.append(playList)
     }
 
-    func setBilibili(info: VideoPlayURLInfo, subtitles: [SubtitleData], aid: Int, maxQuality: Int? = nil, streamIndex: Int? = nil, preferredHost: String? = nil) {
+    func setBilibili(info: VideoPlayURLInfo, subtitles: [SubtitleData], aid: Int, maxQuality: Int? = nil, streamIndex: Int? = nil, preferredHost: String? = nil, preferences: PlayerMediaPreferences = .current) {
         playInfo = info
         self.aid = aid
         self.preferredHost = preferredHost
         reset()
         hasSubtitle = subtitles.count > 0
-        var videos = info.dash.video
-        if Settings.preferAvc {
-            let videosMap = Dictionary(grouping: videos, by: { $0.id })
-            for (key, values) in videosMap {
-                if values.contains(where: { !$0.isHevc }) {
-                    videos.removeAll(where: { $0.id == key && $0.isHevc })
-                }
-            }
-        }
-
-        // 先过滤黑名单编码（避免后续强制模式选择了被黑名单的流）
-        videos = videos.filter { !videoCodecBlackList.contains($0.codecs) }
-
-        // 智能画质模式：
-        // 1. 如果用户手动选择了具体的流（streamIndex 不为 nil），只使用该流
-        // 2. 如果用户手动选择了画质（maxQuality 不为 nil），只保留该画质的流（强制模式）
-        // 3. 如果是默认模式，使用设置限制并保留多级画质作为后备（自适应模式）
-        if let streamIndex = streamIndex, streamIndex < info.dash.video.count {
-            // 用户选择了具体的流，直接使用该流
-            videos = [info.dash.video[streamIndex]]
-        } else if let maxQuality = maxQuality {
-            // 用户选择了画质，保留该画质的最高码率流
-            // （手动切画质时一般会带 streamIndex，走上面精确选流；这里是无 streamIndex 的兜底）
-            let matchingStreams = videos.filter { $0.id == maxQuality }
-            if let highestBandwidthStream = matchingStreams.max(by: { $0.bandwidth < $1.bandwidth }) {
-                videos = [highestBandwidthStream]
-            } else {
-                videos = matchingStreams
-            }
-        } else {
-            // 默认模式：自适应模式
-            // 使用设置中的画质限制
-            let qualityLimit = Settings.mediaQuality.qn
-            videos = videos.filter { $0.id <= qualityLimit }
-
-            // 保留最高画质 + 中等画质（1080P）+ 低画质（720P 及以下）作为后备
-            // 这样 AVPlayer 可以根据网络状况自动降级
-            let highestQuality = videos.map { $0.id }.max() ?? qualityLimit
-
-            // 保留最高画质的所有编码
-            let highQualityVideos = videos.filter { $0.id == highestQuality }
-
-            // 保留中等画质作为后备（1080P 及以下，但不包括最高画质）
-            let fallbackVideos = videos.filter { $0.id < highestQuality && $0.id >= 80 }
-
-            // 保留低画质作为紧急后备（720P 及以下）
-            let emergencyVideos = videos.filter { $0.id < 80 && $0.id >= 64 }
-
-            // 合并：最高画质 + 中等画质 + 低画质
-            videos = highQualityVideos + fallbackVideos + emergencyVideos
-        }
-
-        // 按 bandwidth 降序排序（码率最高的优先，让 AVPlayer 优先选择）
-        // 这样可以确保在同一画质等级下，AVPlayer 会选择码率最高的流
-        videos.sort { $0.bandwidth > $1.bandwidth }
+        let videos = preferences.selectVideos(from: info.dash.video,
+                                              maxQuality: maxQuality,
+                                              streamIndex: streamIndex,
+                                              excluding: videoCodecBlackList)
 
         collectCDNCandidates(from: videos.first)
 
@@ -390,7 +339,7 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
             }
         }
 
-        if Settings.losslessAudio {
+        if preferences.losslessAudio {
             if let audios = info.dash.dolby?.audio {
                 // 只添加第一个杜比音频流的第一个 URL
                 if let firstAudio = audios.first,

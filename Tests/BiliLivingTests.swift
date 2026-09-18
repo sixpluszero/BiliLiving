@@ -6,10 +6,96 @@ import CocoaAsyncSocket
 @testable import BilibiliLive
 
 final class BiliLivingTests: XCTestCase {
-    func testDefaultNavigationAnd1080pPolicy() {
+    func testDefaultNavigationAndQualityPolicy() {
         XCTAssertEqual(TabBarPage.defaultTabBarPages, [.feed, .search, .personal])
         XCTAssertEqual(MediaQualityEnum.quality_1080p.qn, 80)
         XCTAssertEqual(Settings.defaultPlacements.filter { $0.section == .tabBar }.map(\.page), [.feed, .search, .personal])
+    }
+
+    func testDefaultQualityPersistsExistingChoice() throws {
+        let key = "Settings.mediaQuality"
+        let original = UserDefaults.standard.object(forKey: key)
+        defer {
+            if let original { UserDefaults.standard.set(original, forKey: key) }
+            else { UserDefaults.standard.removeObject(forKey: key) }
+        }
+        UserDefaults.standard.removeObject(forKey: key)
+        XCTAssertEqual(Settings.mediaQuality, .bestAvailable)
+        for quality in MediaQualityEnum.allCases {
+            Settings.mediaQuality = quality
+            XCTAssertEqual(Settings.mediaQuality, quality)
+        }
+        // Existing enum encodings must still decode after adding the new case.
+        let saved = Data(#"{"quality_2160p":{}}"#.utf8)
+        UserDefaults.standard.set(saved, forKey: key)
+        XCTAssertEqual(Settings.mediaQuality, .quality_2160p)
+    }
+
+    func testQualitySelectionHonors4KAndBestAvailable() throws {
+        func stream(_ quality: Int, _ codec: String, _ bandwidth: Int) -> VideoPlayURLInfo.DashInfo.DashMediaInfo {
+            .init(id: quality, base_url: "https://example.invalid/video.m4s", backup_url: nil,
+                  bandwidth: bandwidth, mime_type: "video/mp4", codecs: codec,
+                  width: 3840, height: 2160, frame_rate: "30", sar: nil, start_with_sap: nil,
+                  segment_base: .init(initialization: "0-100", index_range: "101-200"), codecid: nil)
+        }
+        let streams = [stream(64, "avc1.640028", 1000), stream(80, "avc1.640028", 2000),
+                       stream(120, "hvc1.1.6.L153.B0", 4000), stream(120, "avc1.640034", 6000),
+                       stream(126, "dvh1.08.06", 5000), stream(127, "av01.0.16M.10", 7000)]
+        let fourK = PlayerMediaPreferences(quality: .quality_2160p, preferAVC: true, losslessAudio: false)
+        let best = PlayerMediaPreferences(quality: .bestAvailable, preferAVC: true, losslessAudio: false)
+        XCTAssertEqual(fourK.selectVideos(from: streams).map(\.id), [120], "4K must not include lower ABR variants")
+        XCTAssertEqual(fourK.selectVideos(from: streams).first?.codecs, "avc1.640034")
+        XCTAssertEqual(best.selectVideos(from: streams).map(\.id), [126], "Skip unsupported AV1, retain highest playable quality")
+        XCTAssertEqual(fourK.selectVideos(from: Array(streams.prefix(2))).map(\.id), [80], "Fall back when source/account lacks 4K")
+        XCTAssertEqual(best.selectVideos(from: Array(streams.prefix(1))).map(\.id), [64])
+        XCTAssertEqual(best.selectVideos(from: streams, streamIndex: 1).map(\.id), [80], "Explicit quality still overrides the default")
+        XCTAssertTrue(best.selectVideos(from: streams, streamIndex: -1).isEmpty)
+        XCTAssertTrue(best.selectVideos(from: streams, streamIndex: 5).isEmpty)
+        XCTAssertNotEqual(PlayerMediaWarmupManager.CacheKey(sequenceKey: "same-video", preferences: fourK),
+                          PlayerMediaWarmupManager.CacheKey(sequenceKey: "same-video", preferences: best),
+                          "Changing defaults must not reuse a warmed asset at the old quality")
+    }
+
+    @MainActor func testFollowUsesVerifiedStateAndPreservesStateOnFailure() async throws {
+        enum Failure: Error { case rejected }
+        var writes = [Bool]()
+        var reject = true
+        let model = UploaderFollowModel(isFollowing: false, read: { true }, write: { following in
+            writes.append(following)
+            if reject { throw Failure.rejected }
+        })
+        do { try await model.toggle(); XCTFail("Request should fail") } catch {}
+        XCTAssertEqual(writes, [false], "Verify an existing follow before sending an unfollow")
+        XCTAssertTrue(model.isFollowing, "Failure must not show a false success")
+        XCTAssertFalse(model.isBusy)
+        reject = false
+        try await model.toggle()
+        XCTAssertFalse(model.isFollowing)
+        try await model.toggle()
+        XCTAssertTrue(model.isFollowing)
+        XCTAssertEqual(writes, [false, false, true])
+        XCTAssertEqual(model.title, "已关注")
+    }
+
+    @MainActor func testFollowPreventsDuplicateRequests() async throws {
+        var writes = 0
+        var finish: CheckedContinuation<Void, Never>?
+        let model = UploaderFollowModel(isFollowing: false, read: { false }, write: { _ in
+            writes += 1
+            await withCheckedContinuation { finish = $0 }
+        })
+        let first = Task { try await model.toggle() }
+        while finish == nil { await Task.yield() }
+        XCTAssertTrue(model.isBusy)
+        XCTAssertFalse(model.isFollowing)
+        try await model.toggle()
+        XCTAssertEqual(writes, 1)
+        finish?.resume()
+        try await first.value
+        XCTAssertTrue(model.isFollowing)
+        XCTAssertFalse(model.isBusy)
+        for attribute in [0, 128] { XCTAssertFalse(WebRequest.UpSpaceRelation(attribute: attribute).isFollowing) }
+        for attribute in [1, 2, 6] { XCTAssertTrue(WebRequest.UpSpaceRelation(attribute: attribute).isFollowing) }
     }
 
     @MainActor func testQRCodeIsDecodableAtDisplaySize() throws {
@@ -113,7 +199,14 @@ final class BiliLivingTests: XCTestCase {
         var current: [UIMenuElement] = []
         let menu = try XCTUnwrap(selector.addMenuItems(current: &current).first as? UIMenu)
         XCTAssertEqual(menu.title, "清晰度")
-        XCTAssertTrue(menu.children.contains { $0.title == "自动 · 优先 1080p" })
+        XCTAssertTrue(menu.children.contains { $0.title == "默认 · \(Settings.mediaQuality.desp)" })
+        let videoDetail = try await WebRequest.requestDetailVideo(aid: video.aid)
+        let infoTabs = VideoPlayerInfoTabsPlugin(detail: videoDetail,
+                                                currentPlayInfo: PlayInfo(aid: video.aid, cid: video.cid),
+                                                sequenceProvider: nil)
+        let followAction = try XCTUnwrap(infoTabs.addMenuItems(current: &current).first as? UIAction)
+        XCTAssertEqual(followAction.identifier.rawValue, "follow-uploader")
+        XCTAssertFalse(followAction.title.isEmpty)
         nextPlayer.play()
         try await Task.sleep(nanoseconds: 2_000_000_000)
         XCTAssertGreaterThan(nextPlayer.currentTime().seconds, position)
@@ -539,6 +632,88 @@ final class BiliLivingTests: XCTestCase {
         await withCheckedContinuation { continuation in
             vc.dismiss(animated: false) { continuation.resume() }
         }
+    }
+
+    @MainActor func testHomeAccountSwitchDiscardsOldRecommendations() async throws {
+        var account: Int? = 1
+        var oldResponse: CheckedContinuation<LivingHomePage, Error>?
+        let old = LivingHomeVideo(aid: 1, cid: 1, title: "old", ownerName: "", pic: nil)
+        let new = LivingHomeVideo(aid: 2, cid: 2, title: "new", ownerName: "", pic: nil)
+        let model = LivingHomeModel(currentAccount: { account }) { mid, _, _ in
+            if mid == 1 { return try await withCheckedThrowingContinuation { oldResponse = $0 } }
+            return LivingHomePage(videos: [new], nextCursor: 10, hasMore: true)
+        }
+        let oldLoad = Task { await model.load() }
+        try await eventually { oldResponse != nil }
+        account = 2
+        await model.load()
+        oldResponse?.resume(returning: LivingHomePage(videos: [old], nextCursor: 99, hasMore: true))
+        await oldLoad.value
+        XCTAssertEqual(model.videos, [new])
+        XCTAssertEqual(model.accountMID, 2)
+        XCTAssertFalse(model.loading)
+        XCTAssertTrue(model.isPersonalized)
+    }
+
+    @MainActor func testHomePaginationDeduplicationAndRetry() async throws {
+        let a = LivingHomeVideo(aid: 1, cid: 1, title: "A", ownerName: "", pic: nil)
+        let b = LivingHomeVideo(aid: 2, cid: 2, title: "B", ownerName: "", pic: nil)
+        var calls: [(Int, Int)] = []
+        var fail = false
+        let model = LivingHomeModel(currentAccount: { 42 }) { mid, cursor, page in
+            XCTAssertEqual(mid, 42)
+            calls.append((cursor, page))
+            if fail { throw NSError(domain: "HomeTest", code: 1) }
+            return cursor == 0 ? LivingHomePage(videos: [a, a], nextCursor: 10, hasMore: true)
+                : LivingHomePage(videos: [a, b], nextCursor: 20, hasMore: true)
+        }
+        await model.load()
+        XCTAssertEqual(model.videos, [a])
+        fail = true
+        await model.loadMore()
+        XCTAssertNotNil(model.error)
+        XCTAssertEqual(model.videos, [a])
+        fail = false
+        await model.retry()
+        XCTAssertEqual(model.videos, [a, b])
+        XCTAssertEqual(calls.map { $0.0 }, [0, 10, 10])
+        XCTAssertEqual(calls.map { $0.1 }, [1, 2, 2])
+        await model.loadMore()
+        XCTAssertFalse(model.hasMore, "Duplicate-only pages must not trigger endless automatic requests")
+        fail = true
+        await model.load()
+        XCTAssertNotNil(model.error)
+        fail = false
+        await model.retry()
+        XCTAssertEqual(model.videos, [a], "Retry of a failed refresh replaces the old batch")
+    }
+
+    @MainActor func testHomeLogoutClearsAccountContentOnFailure() async {
+        var account: Int? = 42
+        var requested: [Int?] = []
+        let video = LivingHomeVideo(aid: 1, cid: 1, title: "account", ownerName: "", pic: nil)
+        let model = LivingHomeModel(currentAccount: { account }) { mid, _, _ in
+            requested.append(mid)
+            if mid == nil { throw NSError(domain: "HomeTest", code: 1) }
+            return LivingHomePage(videos: [video], nextCursor: 1, hasMore: true)
+        }
+        await model.load()
+        account = nil
+        await model.load()
+        XCTAssertTrue(model.videos.isEmpty)
+        XCTAssertFalse(model.isPersonalized)
+        XCTAssertNotNil(model.error)
+        XCTAssertEqual(requested.count, 2)
+        XCTAssertNil(requested.last!)
+    }
+
+    @MainActor func testLiveHomeRecommendationSource() async throws {
+        // Exercises the real signed app feed, without inventing an account token.
+        let items = try await ApiRequest.getFeeds()
+        XCTAssertFalse(items.isEmpty)
+        XCTAssertTrue(items.allSatisfy { $0.goto == "av" && !$0.title.isEmpty })
+        let guest = try await LivingHomeSource.fetch(accountMID: nil, cursor: 0, page: 1)
+        XCTAssertFalse(guest.videos.isEmpty)
     }
 
     @MainActor private func eventually(timeout: TimeInterval = 10, _ condition: () -> Bool) async throws {

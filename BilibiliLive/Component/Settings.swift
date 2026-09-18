@@ -33,7 +33,7 @@ enum Settings {
     @UserDefault("Settings.direatlyEnterVideo", defaultValue: false)
     static var direatlyEnterVideo: Bool
 
-    @UserDefaultCodable("Settings.mediaQuality", defaultValue: .quality_1080p)
+    @UserDefaultCodable("Settings.mediaQuality", defaultValue: .bestAvailable)
     static var mediaQuality: MediaQualityEnum
 
     @UserDefaultCodable("Settings.mediaPlayerSpeed", defaultValue: PlaySpeed.default)
@@ -341,7 +341,8 @@ extension FeaturedDurationLimit {
     }
 }
 
-enum MediaQualityEnum: Codable, CaseIterable {
+enum MediaQualityEnum: Codable, CaseIterable, Hashable {
+    case bestAvailable
     case quality_1080p
     case quality_2160p
     case quality_hdr_dolby
@@ -350,6 +351,8 @@ enum MediaQualityEnum: Codable, CaseIterable {
 extension MediaQualityEnum {
     var desp: String {
         switch self {
+        case .bestAvailable:
+            return "最佳可用"
         case .quality_1080p:
             return "1080p"
         case .quality_2160p:
@@ -361,6 +364,8 @@ extension MediaQualityEnum {
 
     var qn: Int {
         switch self {
+        case .bestAvailable:
+            return 127
         case .quality_1080p:
             return 80
         case .quality_2160p:
@@ -372,6 +377,8 @@ extension MediaQualityEnum {
 
     var fnval: Int {
         switch self {
+        case .bestAvailable:
+            return 976
         case .quality_1080p:
             return 16
         case .quality_2160p:

@@ -21,7 +21,7 @@ class BVideoQualityPlugin: NSObject, CommonPlayerPlugin {
             $0.element.codecs.hasPrefix("avc") || $0.element.isHevc
         }, by: { $0.element.id })
         guard !groups.isEmpty else { return [] }
-        var actions: [UIMenuElement] = [UIAction(title: "自动 · 优先 1080p", state: selectedID == nil ? .on : .off) { [weak self] _ in
+        var actions: [UIMenuElement] = [UIAction(title: "默认 · \(Settings.mediaQuality.desp)", state: selectedID == nil ? .on : .off) { [weak self] _ in
             self?.select(quality: nil, index: nil)
         }]
         for id in groups.keys.sorted(by: >) {

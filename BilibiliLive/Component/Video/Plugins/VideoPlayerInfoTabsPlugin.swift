@@ -54,6 +54,9 @@ final class VideoPlayerInfoTabsPlugin: NSObject, CommonPlayerPlugin {
         relatedCandidates = Self.makeRelatedEntries(detail: detail, currentPlayInfo: currentPlayInfo)
         actionInfoViewController = VideoPlayerActionInfoViewController(detail: detail)
         super.init()
+        actionInfoViewController.onFollowChange = { [weak self] in
+            (self?.playerVC?.parent as? CommonPlayerViewController)?.updateMenus()
+        }
 
         let onSelect: (PlayInfo) -> Void = { [weak self] playInfo in
             guard let self else { return }
@@ -78,6 +81,23 @@ final class VideoPlayerInfoTabsPlugin: NSObject, CommonPlayerPlugin {
     func playerDidLoad(playerVC: AVPlayerViewController) {
         self.playerVC = playerVC
         refreshCustomInfoViewControllers()
+    }
+
+    func addMenuItems(current: inout [UIMenuElement]) -> [UIMenuElement] {
+        MainActor.assumeIsolated {
+            guard ownerMid > 0 else { return [] }
+            let model = actionInfoViewController.followModel
+            return [UIAction(title: model.title,
+                             image: UIImage(systemName: model.isFollowing ? "person.badge.minus" : "person.badge.plus"),
+                             identifier: UIAction.Identifier("follow-uploader"),
+                             attributes: model.isBusy ? .disabled : [],
+                             state: model.isFollowing ? .on : .off) { [weak self] _ in
+                guard let self, let playerVC = self.playerVC else { return }
+                Task { @MainActor in
+                    self.actionInfoViewController.followModel.toggle(from: playerVC)
+                }
+            }]
+        }
     }
 
     func playerDidDismiss(playerVC: AVPlayerViewController) {

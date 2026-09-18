@@ -163,6 +163,8 @@ final class VideoPlayerActionInfoViewController: UIViewController {
 
     private let aid: Int
     private let ownerMid: Int
+    let followModel: UploaderFollowModel
+    var onFollowChange: (() -> Void)?
     private var entries: [Entry]
     private var inFlightKinds = Set<ActionKind>()
     private var locallyMutatedKinds = Set<ActionKind>()
@@ -196,6 +198,8 @@ final class VideoPlayerActionInfoViewController: UIViewController {
     init(detail: VideoDetail?) {
         aid = detail?.View.aid ?? 0
         ownerMid = detail?.View.owner.mid ?? 0
+        followModel = UploaderFollowModel(mid: detail?.View.owner.mid ?? 0,
+                                          isFollowing: detail?.Card.following ?? false)
         let followerText = "\((detail?.Card.follower ?? 0).numberString())粉丝"
         let likeCount = detail?.View.stat.like ?? 0
         let favoriteCount = detail?.View.stat.favorite ?? 0
@@ -206,6 +210,14 @@ final class VideoPlayerActionInfoViewController: UIViewController {
         ]
         super.init(nibName: nil, bundle: nil)
         title = "互动"
+        followModel.onChange = { [weak self] in
+            guard let self else { return }
+            self.updateState(for: .follow, isOn: self.followModel.isFollowing)
+            self.onFollowChange?()
+        }
+        if ownerMid > 0, ApiRequest.isLogin() {
+            Task { [weak self] in try? await self?.followModel.refresh() }
+        }
         loadRemoteStatesIfNeeded()
     }
 
@@ -268,14 +280,8 @@ final class VideoPlayerActionInfoViewController: UIViewController {
     }
 
     private func handleFollow() {
-        guard requireLivingAccount() else { return }
-        guard ownerMid > 0,
-              let index = entries.firstIndex(where: { $0.kind == .follow })
-        else { return }
-
-        entries[index].isOn.toggle()
-        collectionView.reloadData()
-        WebRequest.follow(mid: ownerMid, follow: entries[index].isOn)
+        guard ownerMid > 0 else { return }
+        followModel.toggle(from: self)
     }
 
     private func handleLike() {
@@ -392,7 +398,7 @@ extension VideoPlayerActionInfoViewController: UICollectionViewDataSource, UICol
         let entry = entries[indexPath.item]
         let cell = collectionView.dequeueReusableCell(withReuseIdentifier: String(describing: VideoPlayerInfoActionCell.self),
                                                       for: indexPath) as! VideoPlayerInfoActionCell
-        cell.update(viewModel: .init(title: entry.kind.title,
+        cell.update(viewModel: .init(title: entry.kind == .follow ? followModel.title : entry.kind.title,
                                      valueText: entry.valueText,
                                      imageName: entry.kind.imageName,
                                      selectedImageName: entry.kind.selectedImageName,

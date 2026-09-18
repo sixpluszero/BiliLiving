@@ -81,6 +81,7 @@ class VideoDetailViewController: UIViewController {
     private var playTimeInSecond: Int?
     private var subType: Int?
     private var data: VideoDetail?
+    private var followModel: UploaderFollowModel?
     @IBOutlet var scrollView: UIScrollView!
     private var didSentCoins = 0 {
         didSet {
@@ -408,7 +409,18 @@ class VideoDetailViewController: UIViewController {
         durationLabel.text = data.View.durationString
         titleLabel.text = data.title
         upButton.title = data.ownerName
-        followButton.isOn = data.Card.following
+        let followModel = UploaderFollowModel(mid: data.View.owner.mid, isFollowing: data.Card.following)
+        self.followModel = followModel
+        followModel.onChange = { [weak self, weak followModel] in
+            guard let self, let followModel else { return }
+            self.followButton.isOn = followModel.isFollowing
+            self.followButton.title = followModel.title
+            self.followButton.isEnabled = !followModel.isBusy
+        }
+        followModel.onChange?()
+        if ApiRequest.isLogin() {
+            Task { try? await followModel.refresh() }
+        }
 
         // 更新播放按钮标题
         if Settings.continuePlay {
@@ -481,11 +493,7 @@ class VideoDetailViewController: UIViewController {
     }
 
     @IBAction func actionFollow(_ sender: Any) {
-        guard requireLivingAccount() else { return }
-        followButton.isOn.toggle()
-        if let mid = data?.View.owner.mid {
-            WebRequest.follow(mid: mid, follow: followButton.isOn)
-        }
+        followModel?.toggle(from: self)
     }
 
     @IBAction func actionPlay(_ sender: Any) {

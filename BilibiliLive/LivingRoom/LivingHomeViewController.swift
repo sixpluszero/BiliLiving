@@ -19,23 +19,9 @@ final class LivingHomeViewController: UIViewController, BLTabBarContentVCProtoco
     func reloadData() { Task { await model.load() } }
 }
 
-@MainActor final class LivingHomeModel: ObservableObject {
-    @Published var videos: [VideoDetail.Info] = []
-    @Published var loading = false
-    @Published var error: String?
-    func load() async {
-        guard !loading else { return }
-        loading = true
-        error = nil
-        defer { loading = false }
-        do { videos = try await WebRequest.requestHotVideo(page: 1).list }
-        catch { self.error = "暂时无法加载视频，请稍后重试。" }
-    }
-}
-
 struct LivingHomeView: View {
     @ObservedObject var model: LivingHomeModel
-    let open: (VideoDetail.Info) -> Void
+    let open: (LivingHomeVideo) -> Void
     let search: () -> Void
     var body: some View {
         ScrollView {
@@ -50,7 +36,7 @@ struct LivingHomeView: View {
                         LinearGradient(colors: [Color(white: 0.06), Color(white: 0.06).opacity(0.95), .clear], startPoint: .leading, endPoint: .trailing)
                         LinearGradient(colors: [.clear, .black.opacity(0.6)], startPoint: .center, endPoint: .bottom)
                         VStack(alignment: .leading, spacing: 22) {
-                            Text("BILILIVING  /  今日发现").font(.system(size: 20, weight: .semibold, design: .rounded)).tracking(4).foregroundStyle(.white.opacity(0.7))
+                            Text(model.isPersonalized ? "BILILIVING  /  为你推荐" : "BILILIVING  /  热门发现").font(.system(size: 20, weight: .semibold, design: .rounded)).tracking(4).foregroundStyle(.white.opacity(0.7))
                             Text(hero.title).font(.system(size: 48, weight: .bold)).lineLimit(3).frame(maxWidth: 780, alignment: .leading)
                             Text(hero.ownerName).font(.system(size: 24)).foregroundStyle(.white.opacity(0.65))
                             HStack(spacing: 20) {
@@ -61,9 +47,10 @@ struct LivingHomeView: View {
                         }.padding(56)
                     }.frame(height: 510).clipShape(RoundedRectangle(cornerRadius: 30)).focusSection()
                     HStack(alignment: .firstTextBaseline) {
-                        Text("此刻，值得一看").font(.system(size: 34, weight: .bold))
+                        Text(model.isPersonalized ? "为你推荐" : "热门视频").font(.system(size: 34, weight: .bold))
                         Spacer()
-                        Text("1080p 优先 · 弹幕随行").font(.system(size: 21)).foregroundStyle(.secondary)
+                        Button("换一批") { Task { await model.load() } }
+                            .disabled(model.loading).accessibilityIdentifier("living.home.refresh")
                     }
                     LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 36), count: 3), spacing: 44) {
                         ForEach(Array(model.videos.dropFirst().enumerated()), id: \.element.aid) { index, video in
@@ -75,13 +62,27 @@ struct LivingHomeView: View {
                                     Text(video.ownerName).font(.system(size: 20)).foregroundStyle(.secondary).lineLimit(1)
                                 }
                             }.buttonStyle(.card).accessibilityIdentifier("living.video.\(index)")
+                                .onAppear {
+                                    if index >= model.videos.count - 7, model.error == nil {
+                                        Task { await model.loadMore() }
+                                    }
+                                }
                         }
+                    }
+                    if model.loading {
+                        ProgressView("正在加载…")
+                    } else if let error = model.error {
+                        Text(error).font(.system(size: 24)).foregroundStyle(.secondary)
+                        Button("重试") { Task { await model.retry() } }
+                    } else if model.hasMore {
+                        Button("加载更多") { Task { await model.loadMore() } }
+                            .accessibilityIdentifier("living.home.more")
                     }
                 } else {
                     VStack(alignment: .leading, spacing: 28) {
                         Text("BiliLiving").font(.system(size: 76, weight: .bold))
                         Text("好视频，坐下来慢慢看。").font(.system(size: 36)).foregroundStyle(.secondary)
-                        if model.loading { ProgressView("正在发现精彩内容…") }
+                        if model.loading { ProgressView(model.isPersonalized ? "正在加载账号推荐…" : "正在加载热门视频…") }
                         if let error = model.error {
                             Text(error).font(.system(size: 24)).foregroundStyle(.secondary)
                             Button("重新加载") { Task { await model.load() } }
@@ -162,7 +163,7 @@ struct LivingLibraryView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .focusSection()
-            Text("默认优先 1080p，可在播放器中切换清晰度。\n搜索时可打字输入，或按住 Siri 遥控器麦克风键听写。")
+            Text("可在设置中选择默认清晰度，也可在播放器中随时切换。\n搜索时可打字输入，或按住 Siri 遥控器麦克风键听写。")
                 .font(.system(size: 24)).foregroundStyle(.secondary).lineSpacing(12)
                 .lineLimit(3).fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
             Spacer()

@@ -24,7 +24,8 @@ enum PlayerMediaFactory {
                         playerInfo: PlayerInfo?,
                         maxQuality: Int? = nil,
                         streamIndex: Int? = nil,
-                        preferredHost: String? = nil) async throws -> PreparedPlayerMedia
+                        preferredHost: String? = nil,
+                        preferences: PlayerMediaPreferences = .current) async throws -> PreparedPlayerMedia
     {
         let playURL = URL(string: BilibiliVideoResourceLoaderDelegate.URLs.play)!
         let headers: [String: String] = [
@@ -38,7 +39,8 @@ enum PlayerMediaFactory {
                              aid: aid,
                              maxQuality: maxQuality,
                              streamIndex: streamIndex,
-                             preferredHost: preferredHost)
+                             preferredHost: preferredHost,
+                             preferences: preferences)
         // Warmed/sequence playback also needs throughput selection; preparing
         // only SIDX measures latency and used to bypass the normal CDN probe.
         await delegate.selectPreferredCDNIfNeeded()
@@ -61,6 +63,11 @@ enum PlayerMediaFactory {
 }
 
 actor PlayerMediaWarmupManager {
+    struct CacheKey: Hashable {
+        let sequenceKey: String
+        let preferences: PlayerMediaPreferences
+    }
+
     private struct InFlightEntry {
         let token: UUID
         let task: Task<PreparedPlayerMedia, Error>
@@ -68,9 +75,9 @@ actor PlayerMediaWarmupManager {
 
     private let maxPreparedEntries = 4
     private let playContextCache: PlayContextCache
-    private var prepared = [String: PreparedPlayerMedia]()
-    private var inFlight = [String: InFlightEntry]()
-    private var accessOrder = [String]()
+    private var prepared = [CacheKey: PreparedPlayerMedia]()
+    private var inFlight = [CacheKey: InFlightEntry]()
+    private var accessOrder = [CacheKey]()
     private var cancellationGeneration = 0
 
     init(playContextCache: PlayContextCache) {
@@ -86,7 +93,8 @@ actor PlayerMediaWarmupManager {
         let resolvedPlayInfo = try await PlayInfoResolver.resolve(playInfo)
         try Task.checkCancellation()
         guard cancellationGeneration == generation else { throw CancellationError() }
-        let key = resolvedPlayInfo.sequenceKey
+        let preferences = PlayerMediaPreferences.current
+        let key = CacheKey(sequenceKey: resolvedPlayInfo.sequenceKey, preferences: preferences)
         if let cached = prepared[key] {
             touch(key)
             return cached
@@ -103,7 +111,8 @@ actor PlayerMediaWarmupManager {
             return try await PlayerMediaFactory.prepare(
                 aid: resolvedPlayInfo.aid,
                 urlInfo: snapshot.videoPlayURLInfo,
-                playerInfo: snapshot.playerInfo
+                playerInfo: snapshot.playerInfo,
+                preferences: preferences
             )
         }
 
@@ -112,7 +121,7 @@ actor PlayerMediaWarmupManager {
         return try await resolve(entry, for: key)
     }
 
-    private func resolve(_ entry: InFlightEntry, for key: String) async throws -> PreparedPlayerMedia {
+    private func resolve(_ entry: InFlightEntry, for key: CacheKey) async throws -> PreparedPlayerMedia {
         do {
             let media = try await entry.task.value
             if let cached = prepared[key] {
@@ -143,7 +152,7 @@ actor PlayerMediaWarmupManager {
         accessOrder.removeAll()
     }
 
-    private func touch(_ key: String) {
+    private func touch(_ key: CacheKey) {
         accessOrder.removeAll { $0 == key }
         accessOrder.append(key)
     }

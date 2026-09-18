@@ -534,8 +534,7 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
             container.manuallyManagedPlayerItem = playerItem
         }
 
-        // 设置 preferredPeakBitRate 为一个很高的值，让 AVPlayer 优先选择高码率流
-        // 0 表示无限制，让 AVPlayer 根据网络条件自动选择最高可用码率
+        // The manifest already fixes the selected quality; keep its bitrate uncapped.
         playerItem.preferredPeakBitRate = 0
 
         // Begin with a small seek/startup window. playerDidChange installs a

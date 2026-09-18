@@ -5,18 +5,6 @@
 	};
 	objectVersion = 70;
 	objects = {
-BA0000000000000000000001 = { isa = PBXNativeTarget; buildConfigurationList = BA0000000000000000000002; buildPhases = (BA0000000000000000000005, BA0000000000000000000006, ); buildRules = (); dependencies = (BA000000000000000000000A, ); name = BiliLivingTests; productName = BiliLivingTests; productReference = BA0000000000000000000007; productType = "com.apple.product-type.bundle.unit-test"; };
-BA0000000000000000000002 = { isa = XCConfigurationList; buildConfigurations = (BA0000000000000000000003, BA0000000000000000000004, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
-BA0000000000000000000003 = { isa = XCBuildConfiguration; buildSettings = { BUNDLE_LOADER = "$(TEST_HOST)"; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = com.jialin.BiliLivingTests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = appletvos; SUPPORTED_PLATFORMS = "appletvos appletvsimulator"; TARGETED_DEVICE_FAMILY = 3; TVOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/BilibiliLive.app/BilibiliLive"; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@loader_path/Frameworks", ); }; name = Debug; };
-BA0000000000000000000004 = { isa = XCBuildConfiguration; buildSettings = { BUNDLE_LOADER = "$(TEST_HOST)"; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = com.jialin.BiliLivingTests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = appletvos; SUPPORTED_PLATFORMS = "appletvos appletvsimulator"; TARGETED_DEVICE_FAMILY = 3; TVOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/BilibiliLive.app/BilibiliLive"; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@loader_path/Frameworks", ); }; name = Release; };
-BA0000000000000000000005 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (BA0000000000000000000009, ); runOnlyForDeploymentPostprocessing = 0; };
-BA0000000000000000000006 = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
-BA0000000000000000000007 = { isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = BiliLivingTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-BA0000000000000000000008 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Tests/BiliLivingTests.swift; sourceTree = SOURCE_ROOT; };
-BA0000000000000000000009 = { isa = PBXBuildFile; fileRef = BA0000000000000000000008; };
-BA000000000000000000000A = { isa = PBXTargetDependency; target = F9B5734F260F5F7400771ED5; targetProxy = BA000000000000000000000B; };
-BA000000000000000000000B = { isa = PBXContainerItemProxy; containerPortal = F9B57348260F5F7400771ED5; proxyType = 1; remoteGlobalIDString = F9B5734F260F5F7400771ED5; remoteInfo = BilibiliLive; };
-
 
 /* Begin PBXBuildFile section */
 		0A41EE192A630FEA0066444C /* SwiftProtobuf in Frameworks */ = {isa = PBXBuildFile; productRef = 0A41EE182A630FEA0066444C /* SwiftProtobuf */; };
@@ -29,12 +17,23 @@ BA000000000000000000000B = { isa = PBXContainerItemProxy; containerPortal = F9B5
 		499C76132931A781003160FB /* Swifter in Frameworks */ = {isa = PBXBuildFile; productRef = 499C76122931A781003160FB /* Swifter */; };
 		499C76162931A7AE003160FB /* SwiftyXMLParser in Frameworks */ = {isa = PBXBuildFile; productRef = 499C76152931A7AE003160FB /* SwiftyXMLParser */; };
 		695081FB2D0FD9E30063044D /* PocketSVG in Embed Frameworks */ = {isa = PBXBuildFile; productRef = 49078E46291BEA2400F556BD /* PocketSVG */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		BA0000000000000000000009 /* Tests/BiliLivingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0000000000000000000008 /* Tests/BiliLivingTests.swift */; };
 		F9171D5F2900FCFB002868C7 /* SnapKit in Frameworks */ = {isa = PBXBuildFile; productRef = F9171D5E2900FCFB002868C7 /* SnapKit */; };
 		F927ED65260F917D00EAB8E3 /* Gzip in Frameworks */ = {isa = PBXBuildFile; productRef = F927ED64260F917D00EAB8E3 /* Gzip */; };
 		F927ED9F2610B5C300EAB8E3 /* Kingfisher in Frameworks */ = {isa = PBXBuildFile; productRef = F927ED9E2610B5C300EAB8E3 /* Kingfisher */; };
 		F9B5736E260F652C00771ED5 /* Alamofire in Frameworks */ = {isa = PBXBuildFile; productRef = F9B5736D260F652C00771ED5 /* Alamofire */; };
 		F9B57378260F6BB400771ED5 /* SwiftyJSON in Frameworks */ = {isa = PBXBuildFile; productRef = F9B57377260F6BB400771ED5 /* SwiftyJSON */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		BA000000000000000000000B /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = F9B57348260F5F7400771ED5 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = F9B5734F260F5F7400771ED5;
+			remoteInfo = BilibiliLive;
+		};
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
 		499C75F7293096EC003160FB /* Embed Frameworks */ = {
@@ -51,6 +50,8 @@ BA000000000000000000000B = { isa = PBXContainerItemProxy; containerPortal = F9B5
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		173FCC343058E5C9008B7D00 /* BiliLivingTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BiliLivingTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		BA0000000000000000000008 /* Tests/BiliLivingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Tests/BiliLivingTests.swift; sourceTree = SOURCE_ROOT; };
 		F9B57350260F5F7400771ED5 /* BilibiliLive.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = BilibiliLive.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -69,6 +70,13 @@ BA000000000000000000000B = { isa = PBXContainerItemProxy; containerPortal = F9B5
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		BA0000000000000000000006 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		F9B5734D260F5F7400771ED5 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -97,7 +105,7 @@ BA000000000000000000000B = { isa = PBXContainerItemProxy; containerPortal = F9B5
 			isa = PBXGroup;
 			children = (
 				4930B8FD2D686DC30074E861 /* BilibiliLive */,
- BA0000000000000000000008,
+				BA0000000000000000000008 /* Tests/BiliLivingTests.swift */,
 				F9B57351260F5F7400771ED5 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -106,6 +114,7 @@ BA000000000000000000000B = { isa = PBXContainerItemProxy; containerPortal = F9B5
 			isa = PBXGroup;
 			children = (
 				F9B57350260F5F7400771ED5 /* BilibiliLive.app */,
+				173FCC343058E5C9008B7D00 /* BiliLivingTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -113,11 +122,27 @@ BA000000000000000000000B = { isa = PBXContainerItemProxy; containerPortal = F9B5
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		BA0000000000000000000001 /* BiliLivingTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = BA0000000000000000000002 /* Build configuration list for PBXNativeTarget "BiliLivingTests" */;
+			buildPhases = (
+				BA0000000000000000000005 /* Sources */,
+				BA0000000000000000000006 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				BA000000000000000000000A /* PBXTargetDependency */,
+			);
+			name = BiliLivingTests;
+			productName = BiliLivingTests;
+			productReference = 173FCC343058E5C9008B7D00 /* BiliLivingTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		F9B5734F260F5F7400771ED5 /* BilibiliLive */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = F9B57362260F5F7600771ED5 /* Build configuration list for PBXNativeTarget "BilibiliLive" */;
 			buildPhases = (
-
 				F9B5734C260F5F7400771ED5 /* Sources */,
 				F9B5734D260F5F7400771ED5 /* Frameworks */,
 				F9B5734E260F5F7400771ED5 /* Resources */,
@@ -196,7 +221,7 @@ BA000000000000000000000B = { isa = PBXContainerItemProxy; containerPortal = F9B5
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
- BA0000000000000000000001,
+				BA0000000000000000000001 /* BiliLivingTests */,
 				F9B5734F260F5F7400771ED5 /* BilibiliLive */,
 			);
 		};
@@ -212,29 +237,15 @@ BA000000000000000000000B = { isa = PBXContainerItemProxy; containerPortal = F9B5
 		};
 /* End PBXResourcesBuildPhase section */
 
-/* Begin PBXShellScriptBuildPhase section */
-		4947421429050FAF005D6885 /* Swift formate */ = {
-			isa = PBXShellScriptBuildPhase;
-			alwaysOutOfDate = 1;
+/* Begin PBXSourcesBuildPhase section */
+		BA0000000000000000000005 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-			);
-			name = "Swift formate";
-			outputFileListPaths = (
-			);
-			outputPaths = (
+				BA0000000000000000000009 /* Tests/BiliLivingTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "cd BuildTools\nSDKROOT=(xcrun --sdk macosx --show-sdk-path)\nswift run -c release swiftformat --disable unusedArguments,numberFormatting,redundantReturn,andOperator,anyObjectProtocol,trailingClosures,redundantFileprivate --ranges nospace --swiftversion 5 \"$SRCROOT\"\n";
 		};
-/* End PBXShellScriptBuildPhase section */
-
-/* Begin PBXSourcesBuildPhase section */
 		F9B5734C260F5F7400771ED5 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -244,7 +255,57 @@ BA000000000000000000000B = { isa = PBXContainerItemProxy; containerPortal = F9B5
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		BA000000000000000000000A /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = F9B5734F260F5F7400771ED5 /* BilibiliLive */;
+			targetProxy = BA000000000000000000000B /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		BA0000000000000000000003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.jialin.BiliLivingTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = appletvos;
+				SUPPORTED_PLATFORMS = "appletvos appletvsimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 3;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/BilibiliLive.app/BilibiliLive";
+				TVOS_DEPLOYMENT_TARGET = 17.0;
+			};
+			name = Debug;
+		};
+		BA0000000000000000000004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.jialin.BiliLivingTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = appletvos;
+				SUPPORTED_PLATFORMS = "appletvos appletvsimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 3;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/BilibiliLive.app/BilibiliLive";
+				TVOS_DEPLOYMENT_TARGET = 17.0;
+			};
+			name = Release;
+		};
 		F9B57360260F5F7600771ED5 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -370,7 +431,7 @@ BA000000000000000000000B = { isa = PBXContainerItemProxy; containerPortal = F9B5
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 2ZB848ZQ3T;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/BilibiliLive/Vendor",
@@ -401,7 +462,7 @@ BA000000000000000000000B = { isa = PBXContainerItemProxy; containerPortal = F9B5
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 2ZB848ZQ3T;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/BilibiliLive/Vendor",
@@ -427,6 +488,15 @@ BA000000000000000000000B = { isa = PBXContainerItemProxy; containerPortal = F9B5
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		BA0000000000000000000002 /* Build configuration list for PBXNativeTarget "BiliLivingTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				BA0000000000000000000003 /* Debug */,
+				BA0000000000000000000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
 		F9B5734B260F5F7400771ED5 /* Build configuration list for PBXProject "BilibiliLive" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
