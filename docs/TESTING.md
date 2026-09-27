@@ -183,3 +183,30 @@ tvOS Release 无签名构建通过，产物 `build/artifacts/BiliLiving-quality-
 同一轮排查的真实测速样本出现正文约 54 Mbps 而含等待约 13 Mbps，以及复用连接后正文约 796 Mbps 的短时值，说明只测 256 KB 正文会高估持续传输能力；未复现真机原始近三分钟等待，不宣称该问题已修复。本次未重跑无关投屏发现测试。
 
 tvOS Release 无签名构建通过，诊断包 `build/artifacts/BiliLiving-playback-diagnostics-20260917.ipa` 已通过 ZIP 完整性校验。未安装到客厅 Apple TV，真机起播故障需在此版本复现后读取日志。
+
+## 播放中选集（2026-09-27）
+
+环境：Xcode 27.0 (27A266a)、tvOS 26.5 Simulator、Apple TV 4K（第 3 代，1080p）。
+
+专项结果 `build/EpisodeSelection-Final.xcresult`：**11 项通过，0 失败**，包括 9 项新增选集测试及既有画质切换、NVA 投屏接力回归。随后加强焦点断言，`build/EpisodePicker-Focus-Stable.xcresult` 的焦点专项再次通过。
+
+- 分 P 按播放标识去重，验证 45 集恰好分为 1–20、21–40、41–45；非法下标不能选中其他剧集。
+- 合集保留作者顺序及分组，分 P 与合集同时存在时保留用户选择的上下文；缺失附加详情时保留已知合集，不把上一条视频的分 P 混入列表。
+- 番剧正片与特别篇按 EP ID 精确解析；不存在的 EP 不回退到第一集，已知选集可直接提供对应的 AID/CID，普通视频编号入口可识别番剧跳转。
+- 在实际 UIKit 焦点引擎中验证默认聚焦第 27 集、移动焦点不切集、切换范围后焦点进入剧集列表，以及确认第 43 集的回调。选择当前集只关闭列表，保留暂停；播放器清理时不触发选择或恢复播放。截图保存在焦点专项的 XCTest 附件中。
+- 使用真实多分 P 课程 `BV1qW4y1a7fU`，从无详情页队列的直接入口起播；打开/关闭列表保留同一个 AVPlayer 和 AVPlayerItem，选集后 CID 切换、播放时钟前进，原始 37 秒起播位置不带入新分 P。通过投递播放结束事件验证继续播放所选分 P 的下一 P，而非等待整段课程自然播完。
+- 推荐流与系列队列分别维护；选择第 12 集后下一集为第 13 集，原推荐队列不被改写。
+
+可通过 Xcode 运行 `EpisodeSelectionTests`，命令行使用：
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+xcodebuild -project BilibiliLive.xcodeproj -scheme BilibiliLive \
+  -destination "platform=tvOS Simulator,id=$BILILIVING_SIMULATOR_ID" \
+  -derivedDataPath build -parallel-testing-enabled NO \
+  -only-testing:BiliLivingTests/EpisodeSelectionTests CODE_SIGNING_ALLOWED=NO test
+```
+
+额外执行的既有 SOAP 回归在本机出现 `NSURLErrorDomain -1005`（本地 HTTP 连接中断）。在未修改的 `1924783` 基线独立构建中同样复现，结果为 `build/EpisodeSOAPBaseline.xcresult`；未修改这条无关的 HTTP 路径，也不将此次专项通过表述为全套测试通过。
+
+合集和番剧的分组、解析使用受控数据验证；会员/地区受限内容、Apple TV 真机及 Siri Remote 实际方向按键仍需实机确认。本次没有安装到客厅 Apple TV 或发布 IPA。

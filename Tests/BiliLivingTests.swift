@@ -756,6 +756,320 @@ final class BiliLivingTests: XCTestCase {
 
 }
 
+final class EpisodeSelectionTests: XCTestCase {
+    private func partList(count: Int = 45) -> VideoEpisodeList {
+        VideoEpisodeList(sections: [.init(id: "parts-1", title: "视频分 P", kind: .parts, items: (1...count).map {
+            PlayInfo(aid: 1, cid: $0, title: "教程第 \($0) 集")
+        })])
+    }
+
+    func testRangesDeduplicateByEpisodeNotDisplayMetadata() throws {
+        let items = partList().sections[0].items
+        var duplicate = items[0]
+        duplicate.title = "Changed title"
+        let list = VideoEpisodeList(sections: [.init(id: "parts-1", title: "Parts", kind: .parts,
+                                                      items: items + [duplicate, PlayInfo(aid: 0, cid: 0)])])
+        XCTAssertEqual(list.sections[0].items.count, 45)
+        XCTAssertEqual(list.pages.map(\.range), [0..<20, 20..<40, 40..<45])
+        XCTAssertTrue(list.hasChoices)
+        XCTAssertFalse(partList(count: 1).hasChoices)
+        XCTAssertNil(list.item(for: .init(sectionID: "parts-1", index: -1)))
+        XCTAssertNil(list.item(for: .init(sectionID: "parts-1", index: 45)))
+        XCTAssertNil(list.item(for: .init(sectionID: "missing", index: 0)))
+        XCTAssertEqual(list.section(for: duplicate)?.index(of: duplicate), 0)
+        XCTAssertEqual(try XCTUnwrap(list.item(for: .init(sectionID: "parts-1", index: 41))).cid, 42)
+    }
+
+    func testCollectionOrderGroupsAndExplicitPartChoice() throws {
+        let cover = try XCTUnwrap(URL(string: "https://example.invalid/cover.jpg"))
+        let first = VideoDetail.Info.UgcSeason.UgcVideoInfo(id: 1, aid: 200, cid: 201,
+                                                           arc: .init(pic: cover, ctime: 30), title: "First")
+        let second = VideoDetail.Info.UgcSeason.UgcVideoInfo(id: 2, aid: 100, cid: 101,
+                                                            arc: .init(pic: cover, ctime: 10), title: "Second")
+        let extra = VideoDetail.Info.UgcSeason.UgcVideoInfo(id: 3, aid: 300, cid: 301,
+                                                           arc: .init(pic: cover, ctime: 20), title: "Extra")
+        let season = VideoDetail.Info.UgcSeason(id: 7, title: "合集", cover: cover, mid: 1, intro: "", attribute: 0,
+                                                sections: [.init(season_id: 7, id: 70, title: "正篇", episodes: [first, second]),
+                                                           .init(season_id: 7, id: 71, title: "番外", episodes: [extra])])
+        let pages = (1...3).map { VideoPage(cid: 100 + $0, page: $0, epid: nil, from: "vupload", part: "P\($0)") }
+        let detail = VideoDetail(View: .init(aid: 100, cid: 101, title: "Video", videos: 3, pic: cover, desc: "",
+                                             owner: .init(mid: 1, name: "Creator"), pages: pages, dynamic: nil,
+                                             bvid: nil, duration: 100, pubdate: nil, ugc_season: season,
+                                             redirect_url: nil, stat: .init(favorite: 0, coin: 0, like: 0, share: 0, danmaku: 0, view: 0)),
+                                 Related: [], Card: .init(following: false, follower: nil))
+        let list = VideoEpisodeList.video(detail)
+        XCTAssertEqual(list.sections.map(\.id), ["parts-100", "ugc-7-70", "ugc-7-71"])
+        XCTAssertEqual(list.sections[1].items.map(\.aid), [200, 100], "Keep author order, not publication time")
+        let current = PlayInfo(aid: 100, cid: 102)
+        XCTAssertEqual(list.section(for: current)?.id, "ugc-7-70", "A collection recognizes every part of its current video")
+        var navigation = VideoEpisodeNavigation(current: current, followsSeriesAutomatically: true)
+        navigation.update(list: list, current: current, selectedSectionID: "parts-100")
+        XCTAssertEqual(navigation.next?.cid, 103)
+        navigation.update(list: list, current: PlayInfo(aid: second.aid, cid: second.cid), selectedSectionID: "ugc-7-70")
+        XCTAssertNil(navigation.next, "Do not automatically cross from the main group into extras")
+        XCTAssertEqual(navigation.first?.aid, 200)
+        navigation.update(list: VideoEpisodeList(), current: PlayInfo(aid: second.aid, cid: second.cid))
+        XCTAssertEqual(navigation.list.sections.map(\.id), ["ugc-7-70", "ugc-7-71"])
+    }
+
+    func testDirectBangumiRedirectRecognizesEpisodeButNotSeasonURLs() throws {
+        func detail(path: String) throws -> VideoDetail {
+            try JSONDecoder().decode(VideoDetail.self, from: Data("""
+            {
+              "View": {
+                "aid": 42, "cid": 84, "title": "Episode", "owner": {"mid": 1, "name": "Creator"},
+                "duration": 100, "redirect_url": "https://www.bilibili.com/bangumi/play/\(path)",
+                "stat": {"favorite": 0, "coin": 0, "like": 0, "share": 0, "danmaku": 0, "view": 0}
+              },
+              "Related": [], "Card": {"following": false}
+            }
+            """.utf8))
+        }
+        XCTAssertEqual(PlayInfoResolver.bangumiEpisodeID(in: try detail(path: "ep83")), 83)
+        for path in ["ss8", "ep0", "ep-1", "epinvalid"] {
+            XCTAssertNil(PlayInfoResolver.bangumiEpisodeID(in: try detail(path: path)))
+        }
+        XCTAssertNil(PlayInfoResolver.bangumiEpisodeID(in: nil))
+    }
+
+    private func bangumi() throws -> BangumiInfo {
+        try JSONDecoder().decode(BangumiInfo.self, from: Data(#"""
+        {
+          "type": 1, "season_id": 8,
+          "episodes": [
+            {"id": 81, "aid": 801, "cid": 8001, "cover": "https://example.invalid/1.jpg", "title": "1", "long_title": "正片一"},
+            {"id": 82, "aid": 802, "cid": 8002, "cover": "https://example.invalid/2.jpg", "title": "2"}
+          ],
+          "section": [
+            {"id": 9, "title": "特别篇", "episodes": [
+              {"id": 83, "aid": 803, "cid": 8003, "cover": "https://example.invalid/3.jpg", "title": "SP", "long_title": "特别篇"}
+            ]}
+          ],
+          "user_status": {"progress": {"last_time": 25, "last_ep_id": 82, "last_ep_index": "2"}}
+        }
+        """#.utf8))
+    }
+
+    func testBangumiFindsExtrasAndNeverFallsBackFromMissingEpisode() throws {
+        let info = try bangumi()
+        let list = VideoEpisodeList.bangumi(info)
+        XCTAssertEqual(list.sections.map(\.title), ["正片", "特别篇"])
+        XCTAssertEqual(list.sections[0].items.map(\.aid), [801, 802])
+        let extra = try PlayInfoResolver.resolveBangumi(PlayInfo(aid: 0, epid: 83), using: info)
+        XCTAssertEqual(extra.aid, 803)
+        XCTAssertEqual(extra.cid, 8003)
+        XCTAssertEqual(extra.epid, 83)
+        XCTAssertEqual(extra.title, "SP 特别篇")
+        XCTAssertThrowsError(try PlayInfoResolver.resolveBangumi(PlayInfo(aid: 0, epid: 999), using: info))
+        let resumed = try PlayInfoResolver.resolveBangumi(PlayInfo(aid: 0, seasonId: 8), using: info)
+        XCTAssertEqual(resumed.epid, 82)
+        XCTAssertEqual(list.section(for: extra)?.id, "pgc-8-extra-9")
+    }
+
+    func testKnownBangumiListResolvesExactIDsWithoutAnotherRequest() async throws {
+        let list = VideoEpisodeList.bangumi(try bangumi())
+        let result = try await PlayInfoResolver.resolveWithEpisodes(
+            PlayInfo(aid: 1, cid: 2, epid: 83, lastPlayCid: 8003, playTimeInSecond: 25), knownEpisodes: list)
+        XCTAssertEqual(result.playInfo.aid, 803)
+        XCTAssertEqual(result.playInfo.cid, 8003)
+        XCTAssertEqual(result.playInfo.seasonId, 8)
+        XCTAssertEqual(result.playInfo.playTimeInSecond, 25)
+        XCTAssertEqual(result.episodes?.sections.count, 2)
+    }
+
+    @MainActor func testSelectionAdvancesSeriesWithoutReplacingFeedQueue() throws {
+        let list = partList()
+        let current = list.sections[0].items[0]
+        let unrelated = PlayInfo(aid: 2, cid: 100)
+        let feed = VideoSequenceProvider(seq: [current, unrelated])
+        var navigation = VideoEpisodeNavigation(current: current, followsSeriesAutomatically: false)
+        navigation.update(list: list, current: current)
+        XCTAssertFalse(navigation.isFollowingSeries)
+        let selected = try XCTUnwrap(list.item(for: .init(sectionID: "parts-1", index: 11)))
+        navigation.update(list: list, current: selected, selectedSectionID: "parts-1")
+        XCTAssertEqual(navigation.next?.cid, 13, "Selecting episode 12 must continue with episode 13")
+        XCTAssertEqual(feed.currentIndex, 0)
+        XCTAssertEqual(feed.peekNext(), unrelated)
+        navigation.update(list: VideoEpisodeList(), current: selected)
+        XCTAssertEqual(navigation.next?.cid, 13, "A missing metadata response must not discard the active series")
+        navigation.update(list: list, current: list.sections[0].items[44])
+        XCTAssertNil(navigation.next)
+        XCTAssertEqual(navigation.first?.cid, 1, "Looping restarts at episode 1, not episode 2")
+        navigation.leaveSeries()
+        navigation.update(list: list, current: unrelated)
+        XCTAssertFalse(navigation.isFollowingSeries)
+        XCTAssertEqual(feed.playSeq, [current, unrelated])
+    }
+
+    @MainActor func testNativeMenuVisibilityAndNextEpisodeLabel() throws {
+        let list = partList()
+        let currentInfo = list.sections[0].items[0]
+        let plugin = VideoPlayListPlugin(episodes: list, currentPlayInfo: currentInfo)
+        let av = AVPlayerViewController()
+        av.infoViewActions = [UIAction(title: "Keep", identifier: .init("unrelated")) { _ in }]
+        plugin.playerDidLoad(playerVC: av)
+        plugin.navigation = { (list.sections[0].items[1], true) }
+        plugin.playerWillStart(player: AVPlayer())
+        XCTAssertEqual(av.infoViewActions.map(\.title), ["Keep", "下一集"])
+        var menus: [UIMenuElement] = [UIMenu(title: "Settings", identifier: .init("setting"), children: [])]
+        let actions = plugin.addMenuItems(current: &menus)
+        XCTAssertEqual(actions.map(\.title), ["选集"], "The episode button must be a top-level transport action")
+        XCTAssertEqual((actions.first as? UIAction)?.identifier.rawValue, "video.episodes")
+        XCTAssertTrue((menus.first as? UIMenu)?.children.contains { $0.title == "循环播放" } == true)
+        plugin.navigation = { (nil, true) }
+        plugin.playerWillStart(player: AVPlayer())
+        XCTAssertEqual(av.infoViewActions.map(\.title), ["Keep"])
+        let single = VideoPlayListPlugin(episodes: partList(count: 1), currentPlayInfo: currentInfo)
+        XCTAssertFalse(single.addMenuItems(current: &menus).contains { $0.title == "选集" })
+        let failed = VideoPlayListPlugin(episodes: VideoEpisodeList(), currentPlayInfo: currentInfo, episodeLoadFailed: true)
+        XCTAssertTrue(failed.addMenuItems(current: &menus).contains { $0.title == "选集" }, "Failed metadata must remain retryable")
+        plugin.playerWillCleanUp(playerVC: av)
+        XCTAssertEqual(av.infoViewActions.map(\.title), ["Keep"])
+    }
+
+    @MainActor func testPickerFocusRangesConfirmationAndCleanup() async throws {
+        let list = partList()
+        let container = CommonPlayerViewController()
+        let window = try XCTUnwrap(AppDelegate.shared.window)
+        let original = window.rootViewController
+        window.rootViewController = container
+        container.loadViewIfNeeded()
+        let av = try XCTUnwrap(container.children.first as? AVPlayerViewController)
+        let player = AVPlayer()
+        av.player = player
+        let plugin = VideoPlayListPlugin(episodes: list, currentPlayInfo: list.sections[0].items[26])
+        var selections = [VideoEpisodeList.Selection]()
+        plugin.onSelectEpisode = { selections.append($0) }
+        container.addPlugin(plugin: plugin)
+        defer { container.stopPlayback(); window.rootViewController = original }
+        plugin.showEpisodes()
+        let picker = try XCTUnwrap(container.presentedViewController as? VideoEpisodePickerViewController)
+        XCTAssertTrue(container.suspendsAutomaticPlayback)
+        let episodes = try collection(in: picker, identifier: "episode-list")
+        let ranges = try collection(in: picker, identifier: "episode-ranges")
+        try await eventually {
+            !picker.isBeingPresented && episodes.cellForItem(at: IndexPath(item: 6, section: 0))?.isFocused == true
+        }
+        XCTAssertEqual(picker.selectedPageIndex, 1)
+        XCTAssertEqual(episodes.numberOfItems(inSection: 0), 20)
+        let currentCell = try XCTUnwrap(episodes.cellForItem(at: IndexPath(item: 6, section: 0)))
+        XCTAssertTrue(currentCell.accessibilityTraits.contains(.selected))
+        XCTAssertTrue(currentCell.accessibilityLabel?.contains("正在播放") == true)
+        let otherCell = try XCTUnwrap(episodes.cellForItem(at: IndexPath(item: 7, section: 0)))
+        picker.focusEpisode(at: IndexPath(item: 7, section: 0))
+        try await eventually { otherCell.isFocused }
+        XCTAssertTrue(selections.isEmpty, "Moving focus must not switch episodes")
+        // Capture the settled focus colors, not the crossfade between two rows.
+        try await Task.sleep(nanoseconds: 500_000_000)
+        let image = UIGraphicsImageRenderer(size: window.bounds.size).image { _ in
+            window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+        }
+        let attachment = XCTAttachment(image: image)
+        attachment.name = "Episode picker with current episode and ranges"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        picker.collectionView(ranges, didSelectItemAt: IndexPath(item: 2, section: 0))
+        XCTAssertEqual(episodes.numberOfItems(inSection: 0), 5)
+        try await eventually { episodes.cellForItem(at: IndexPath(item: 0, section: 0))?.isFocused == true }
+        XCTAssertTrue(selections.isEmpty)
+        picker.collectionView(episodes, didSelectItemAt: IndexPath(item: 2, section: 0))
+        try await eventually { selections.count == 1 && container.presentedViewController == nil }
+        XCTAssertEqual(selections, [.init(sectionID: "parts-1", index: 42)])
+        XCTAssertEqual(player.rate, 0)
+        XCTAssertFalse(container.suspendsAutomaticPlayback)
+        plugin.showEpisodes()
+        let reopened = try XCTUnwrap(container.presentedViewController as? VideoEpisodePickerViewController)
+        try await eventually { !reopened.isBeingPresented }
+        let reopenedEpisodes = try collection(in: reopened, identifier: "episode-list")
+        reopened.collectionView(reopenedEpisodes, didSelectItemAt: IndexPath(item: 6, section: 0))
+        try await eventually { container.presentedViewController == nil }
+        XCTAssertEqual(selections.count, 1)
+        XCTAssertEqual(player.rate, 0, "Selecting the current episode must only close the picker, preserving pause")
+        plugin.showEpisodes()
+        try await eventually { container.presentedViewController?.isBeingPresented == false }
+        container.stopPlayback()
+        try await eventually { container.presentedViewController == nil }
+        XCTAssertFalse(container.suspendsAutomaticPlayback)
+        XCTAssertEqual(selections.count, 1, "Teardown must not invoke selection or restore playback")
+    }
+
+    @MainActor func testLiveDirectEntrySelectionAndAutomaticNextPart() async throws {
+        // Public multipart course BV1qW4y1a7fU; fetch current CIDs instead of persisting signed URLs.
+        let detail = try await WebRequest.requestDetailVideo(aid: 941747210)
+        let pages = try XCTUnwrap(detail.View.pages)
+        guard pages.count > 2 else {
+            XCTFail("The live fixture must contain at least three parts")
+            return
+        }
+        let info = PlayInfo(aid: detail.View.aid, cid: pages[0].cid)
+        let targetIndex = 1
+        let previousContinue = Settings.continuePlay
+        Settings.continuePlay = false
+        let playerVC = VideoPlayerViewController(playInfo: info, startTimeOverride: 37)
+        let root = try XCTUnwrap(AppDelegate.shared.window?.rootViewController)
+        root.present(playerVC, animated: false)
+        defer {
+            Settings.continuePlay = previousContinue
+            playerVC.stopPlayback()
+            playerVC.dismiss(animated: false)
+        }
+        let av = try XCTUnwrap(playerVC.children.first as? AVPlayerViewController)
+        try await eventually(timeout: 60) { (av.player?.currentTime().seconds ?? 0) > 37 }
+        let oldPlayer = try XCTUnwrap(av.player)
+        let oldItem = oldPlayer.currentItem
+        let button = try XCTUnwrap(av.transportBarCustomMenuItems.compactMap { $0 as? UIAction }.first { $0.identifier.rawValue == "video.episodes" })
+        UIButton(primaryAction: button).sendActions(for: .primaryActionTriggered)
+        let firstPicker = try XCTUnwrap(playerVC.presentedViewController as? VideoEpisodePickerViewController)
+        try await eventually { !firstPicker.isBeingPresented }
+        XCTAssertEqual(oldPlayer.rate, 0)
+        firstPicker.close()
+        try await eventually { playerVC.presentedViewController == nil && oldPlayer.rate > 0 }
+        XCTAssertTrue(av.player === oldPlayer)
+        XCTAssertTrue(oldPlayer.currentItem === oldItem)
+        oldPlayer.pause()
+        UIButton(primaryAction: button).sendActions(for: .primaryActionTriggered)
+        let picker = try XCTUnwrap(playerVC.presentedViewController as? VideoEpisodePickerViewController)
+        try await eventually { !picker.isBeingPresented }
+        let ranges = try collection(in: picker, identifier: "episode-ranges")
+        let episodes = try collection(in: picker, identifier: "episode-list")
+        picker.collectionView(ranges, didSelectItemAt: IndexPath(item: targetIndex / 20, section: 0))
+        picker.collectionView(episodes, didSelectItemAt: IndexPath(item: targetIndex % 20, section: 0))
+        try await eventually(timeout: 60) {
+            playerVC.currentPlayInfo.cid == pages[targetIndex].cid && (av.player?.currentTime().seconds ?? 0) > 1
+        }
+        XCTAssertFalse(av.player === oldPlayer)
+        XCTAssertLessThan(try XCTUnwrap(av.player?.currentTime().seconds), 20, "A cast/preview's 37-second offset must not be reused for another part")
+        XCTAssertEqual(av.infoViewActions.first { $0.title == "下一集" }?.identifier.rawValue,
+                       "play.next.\(PlayInfo(aid: info.aid, cid: pages[targetIndex + 1].cid, title: pages[targetIndex + 1].part).sequenceKey)")
+        let item = try XCTUnwrap(av.player?.currentItem)
+        NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: item)
+        try await eventually(timeout: 60) {
+            playerVC.currentPlayInfo.cid == pages[targetIndex + 1].cid && (av.player?.currentTime().seconds ?? 0) > 1
+        }
+        playerVC.stopPlayback()
+        await withCheckedContinuation { continuation in
+            playerVC.dismiss(animated: false) { continuation.resume() }
+        }
+    }
+
+    @MainActor private func collection(in picker: UIViewController, identifier: String) throws -> UICollectionView {
+        func descendants(_ view: UIView) -> [UIView] { view.subviews.flatMap { [$0] + descendants($0) } }
+        picker.loadViewIfNeeded()
+        return try XCTUnwrap(descendants(picker.view).first { $0.accessibilityIdentifier == identifier } as? UICollectionView)
+    }
+
+    @MainActor private func eventually(timeout: TimeInterval = 10, file: StaticString = #filePath, line: UInt = #line,
+                                      _ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        XCTFail("Timed out waiting for episode selection", file: file, line: line)
+        throw NSError(domain: "EpisodeSelectionTests", code: 1)
+    }
+}
+
 /// A phone-side NVA client over real TCP/UDP sockets, independent of the receiver's frame decoder.
 @MainActor private final class CastTestPhone {
     private let connection: NWConnection

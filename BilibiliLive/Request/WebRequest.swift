@@ -1039,6 +1039,8 @@ struct BangumiInfo: Codable, Hashable {
     }
 
     struct Section: Codable, Hashable {
+        let id: Int?
+        let title: String?
         let episodes: [Episode]
     }
 

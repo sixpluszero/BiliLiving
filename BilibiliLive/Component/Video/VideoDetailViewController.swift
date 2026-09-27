@@ -94,6 +94,7 @@ class VideoDetailViewController: UIViewController {
     private var isBangumi = false
     private var startTime = 0
     private var pages = [VideoPage]()
+    private var episodeList = VideoEpisodeList()
     private var replys: Replys?
     private var subTitles: [SubtitleData]?
 
@@ -249,7 +250,9 @@ class VideoDetailViewController: UIViewController {
         } else {
             vc.present(self, animated: false) { [weak self] in
                 guard let self else { return }
-                let player = VideoPlayerViewController(playInfo: PlayInfo(aid: self.aid, cid: self.cid, epid: self.epid, seasonId: isBangumi ? self.seasonId : nil, lastPlayCid: self.lastPlayCid, playTimeInSecond: self.playTimeInSecond))
+                let player = makePlayer(playInfo: PlayInfo(aid: self.aid, cid: self.cid, epid: self.epid,
+                                                          seasonId: self.seasonId, subType: self.subType,
+                                                          lastPlayCid: self.lastPlayCid, playTimeInSecond: self.playTimeInSecond))
                 self.present(player, animated: true)
             }
         }
@@ -277,6 +280,7 @@ class VideoDetailViewController: UIViewController {
             if seasonId > 0 {
                 isBangumi = true
                 let info = try await WebRequest.requestBangumiInfo(seasonID: seasonId)
+                episodeList = .bangumi(info)
                 subType = info.type
                 if let epi = info.episodes.first(where: { $0.id == info.user_status?.progress?.last_ep_id }) ?? info.episodes.first ?? info.section?.first?.episodes.first {
                     aid = epi.aid
@@ -288,6 +292,7 @@ class VideoDetailViewController: UIViewController {
             } else if epid > 0 {
                 isBangumi = true
                 let info = try await WebRequest.requestBangumiInfo(epid: epid)
+                episodeList = .bangumi(info)
                 seasonId = info.season_id
                 subType = info.type
                 if let epi = info.findEpisodeById(epid) ?? info.episodes.first {
@@ -302,10 +307,11 @@ class VideoDetailViewController: UIViewController {
             let data = try await WebRequest.requestDetailVideo(aid: aid)
             self.data = data
 
-            if let redirect = data.View.redirect_url?.lastPathComponent, redirect.starts(with: "ep"), let id = Int(redirect.dropFirst(2)), !isBangumi {
+            if let id = PlayInfoResolver.bangumiEpisodeID(in: data), !isBangumi {
                 isBangumi = true
                 epid = id
                 let info = try await WebRequest.requestBangumiInfo(epid: epid)
+                episodeList = .bangumi(info)
                 seasonId = info.season_id
                 subType = info.type
                 pages = info.episodes.map({ VideoPage(cid: $0.cid, page: $0.aid, epid: $0.id, from: "", part: $0.title + " " + $0.long_title) })
@@ -377,7 +383,15 @@ class VideoDetailViewController: UIViewController {
             if let epi = season.episodes.first(where: { $0.ep_id == epid }) ?? season.episodes.first {
                 aid = epi.aid
                 cid = epi.cid
+                epid = epi.ep_id
+                seasonId = info.season_id
                 pages = season.episodes.filter { $0.section_type == 0 }.map({ VideoPage(cid: $0.cid, page: $0.aid, epid: $0.ep_id, from: "", part: $0.index + " " + ($0.index_title ?? "")) })
+                episodeList = VideoEpisodeList(sections: [
+                    .init(id: "pgc-\(seasonId)-main", title: "正片", kind: .bangumi, items: pages.map {
+                        PlayInfo(aid: $0.page, cid: $0.cid, epid: $0.epid, seasonId: seasonId,
+                                 subType: subType, title: $0.part)
+                    }),
+                ])
 
                 let userEpisodeInfo = try await WebRequest.requestUserEpisodeInfo(epid: epi.ep_id)
 
@@ -446,6 +460,7 @@ class VideoDetailViewController: UIViewController {
         noteView.label.text = notes.joined(separator: "\n")
         if !isBangumi {
             pages = data.View.pages ?? []
+            episodeList = .video(data)
         }
         updatePageRanges()
         pageRangeCollectionView.reloadData()
@@ -465,19 +480,22 @@ class VideoDetailViewController: UIViewController {
             self.backgroundImageView.alpha = 1
         }
 
+        allUgcEpisodes = []
+        var collectionTitle = ""
         if let season = data.View.ugc_season {
             if season.sections.count > 1 {
                 if let section = season.sections.first(where: { section in section.episodes.contains(where: { episode in episode.aid == data.View.aid }) }) {
                     allUgcEpisodes = section.episodes
+                    collectionTitle = section.title
                 }
             } else {
                 allUgcEpisodes = season.sections.first?.episodes ?? []
+                collectionTitle = season.sections.first?.title ?? ""
             }
-            allUgcEpisodes.sort { $0.arc.ctime < $1.arc.ctime }
         }
 
         ugcCollectionView.reloadData()
-        ugcLabel.text = "合集 \(data.View.ugc_season?.title ?? "")  \(data.View.ugc_season?.sections.first?.title ?? "")"
+        ugcLabel.text = "合集 \(data.View.ugc_season?.title ?? "")  \(collectionTitle)"
         ugcView.isHidden = allUgcEpisodes.count == 0
         if allUgcEpisodes.count > 0 {
             ugcCollectionView.scrollToItem(at: IndexPath(item: allUgcEpisodes.map { $0.aid }.firstIndex(of: aid) ?? 0, section: 0), at: .left, animated: false)
@@ -497,21 +515,18 @@ class VideoDetailViewController: UIViewController {
     }
 
     @IBAction func actionPlay(_ sender: Any) {
-        let player = VideoPlayerViewController(playInfo: PlayInfo(aid: aid, cid: cid, epid: epid, seasonId: seasonId, subType: subType, lastPlayCid: lastPlayCid, playTimeInSecond: playTimeInSecond, title: data?.title))
-        player.data = data
-        if pages.count > 0, let index = pages.firstIndex(where: { $0.cid == cid }) {
-            let seq = pages.map({ PlayInfo(aid: aid, cid: $0.cid, epid: $0.epid, seasonId: seasonId, subType: subType, title: $0.part) })
-            if seq.count > 0 {
-                player.sequenceProvider = VideoSequenceProvider(seq: seq, currentIndex: index)
-            }
-        }
-        if allUgcEpisodes.count > 0, let index = allUgcEpisodes.firstIndex(where: { $0.cid == cid }) {
-            let seq = allUgcEpisodes.map({ PlayInfo(aid: $0.aid, cid: $0.cid, title: $0.title) })
-            if seq.count > 0 {
-                player.sequenceProvider = VideoSequenceProvider(seq: seq, currentIndex: index)
-            }
-        }
+        let player = makePlayer(playInfo: PlayInfo(aid: aid, cid: cid, epid: epid, seasonId: seasonId,
+                                                  subType: subType, lastPlayCid: lastPlayCid,
+                                                  playTimeInSecond: playTimeInSecond, title: data?.title))
         present(player, animated: true, completion: nil)
+    }
+
+    private func makePlayer(playInfo: PlayInfo, preferredSectionID: String? = nil) -> VideoPlayerViewController {
+        let player = VideoPlayerViewController(playInfo: playInfo)
+        player.data = data?.View.aid == playInfo.aid ? data : nil
+        player.episodeList = episodeList
+        player.preferredEpisodeSectionID = preferredSectionID
+        return player
     }
 
     @IBAction func actionLike(_ sender: Any) {
@@ -606,13 +621,11 @@ extension VideoDetailViewController: UICollectionViewDelegate {
             pageCollectionView.scrollToItem(at: IndexPath(item: range.startIndex, section: 0), at: .left, animated: true)
         case pageCollectionView:
             let page = pages[indexPath.item]
-            let player = VideoPlayerViewController(playInfo: PlayInfo(aid: isBangumi ? page.page : aid, cid: page.cid, epid: page.epid, seasonId: seasonId, subType: subType, lastPlayCid: lastPlayCid, playTimeInSecond: playTimeInSecond, title: page.part))
-            player.data = isBangumi ? nil : data
-
-            let seq = pages.map({ PlayInfo(aid: isBangumi ? $0.page : aid, cid: $0.cid, epid: $0.epid, seasonId: seasonId, subType: subType, title: $0.part) })
-            if seq.count > 0 {
-                player.sequenceProvider = VideoSequenceProvider(seq: seq, currentIndex: indexPath.item)
-            }
+            let info = PlayInfo(aid: isBangumi ? page.page : aid, cid: page.cid, epid: page.epid,
+                                seasonId: seasonId, subType: subType, lastPlayCid: lastPlayCid,
+                                playTimeInSecond: playTimeInSecond, title: page.part)
+            let sectionID = isBangumi ? episodeList.section(for: info)?.id : VideoEpisodeList.partsSectionID(aid: aid)
+            let player = makePlayer(playInfo: info, preferredSectionID: sectionID)
             present(player, animated: true, completion: nil)
         case replysCollectionView:
             guard let reply = replys?.replies?[indexPath.item] else { return }

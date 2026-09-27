@@ -32,6 +32,7 @@
 
 ## Recent Updates
 
+- **2026-09-26** — In-player episode selection for multipart videos, creator collections, and series, with playback continuing from the selected episode.
 - **2026-09-15** — Account recommendations and paginated popular videos for guests; “Best available” as the default quality, with a creator follow action in the player.
 - **2026-09-14** — Casting handoff and control improvements, including DLNA SOAP playback, video identification, and danmaku restoration.
 
@@ -49,9 +50,19 @@ See the [testing notes](docs/TESTING.md) (Chinese) for implementation and verifi
 | 🎞 **A home screen for the couch** | Large artwork, a three-column video grid, and remote focus navigation. Signed-in viewers get account recommendations; guests get popular videos, with pagination and refresh. |
 | 🔎 **Native search** | Type with the tvOS keyboard or use Siri Remote dictation, subject to device language, region, and settings. |
 | ▶️ **Native playback** | AVKit controls, quality selection, playback speed, and buffering preferences. Fresh installs default to the best quality available for the current account and video. |
+| 📋 **In-player episode selection** | Open parts, collection groups, or series from the bottom controls. The current episode is focused automatically, and long lists have 20-episode ranges. |
 | 💬 **Danmaku included** | Real video comments, enabled by default in the upper half of the screen, with in-player visibility and display controls. |
 | 📱 **Pick on your phone, watch on TV** | Receive casts from the Bilibili mobile app, resume at the supplied position, and pause, play, or seek from your phone. TV playback continues after the phone disconnects. |
 | 🔐 **Your viewing space** | QR-code login, favorites, history, Watch Later, and creator follows. Tokens and account cookies are stored in the device Keychain. |
+
+### Choose episodes without leaving the player
+
+Open the playback controls and choose **选集** (Episodes). The list marks and focuses the current episode. Use the left column to choose a group or a 20-episode range, then confirm an episode on the right to play it. Moving focus or selecting the current episode does not restart playback.
+
+- Multipart videos, creator collections, and series are supported. Collections keep the author's order, and main episodes and extras are grouped separately. The button is hidden when there are no other episodes.
+- Opening the list pauses playback temporarily; Back restores the previous playing/paused state. After selection, autoplay follows the chosen group without crossing into other groups.
+- Episode metadata is available from detail pages, direct playback, and casts identified as native Bilibili videos. Feed queues remain separate: selecting an episode opts into series playback, while previous/next feed navigation returns to the original queue.
+- Metadata failures can be retried. Failed requests for a new episode's playback URL offer retry or keeping the current video rather than substituting another episode. Server-side membership and regional restrictions still apply.
 
 ### 4K and high-bitrate playback improvements for overseas networks
 

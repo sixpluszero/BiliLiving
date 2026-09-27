@@ -17,6 +17,7 @@ struct PlayerDetailData {
 
     var playerStartPos: Int?
     var detail: VideoDetail?
+    var episodeList: VideoEpisodeList?
     var clips: [VideoPlayURLInfo.ClipInfo]?
     var playerInfo: PlayerInfo?
     var videoPlayURLInfo: VideoPlayURLInfo
@@ -32,16 +33,21 @@ class VideoPlayerViewModel {
     var onExit: (() -> Void)?
     var onPlayInfoChanged: ((PlayInfo) -> Void)?
     var onShowDetail: ((PlayInfo) -> Void)?
+    var onEpisodeSwitchFailure: ((String) -> Void)?
     var sequenceProvider: VideoSequenceProvider?
 
     private var playInfo: PlayInfo
+    private var pendingPlayInfo: PlayInfo?
+    private var pendingEpisodeSectionID: String?
+    private var episodeNavigation: VideoEpisodeNavigation
+    private var hasLoadedVideo = false
     private let playMode: VideoPlayerMode
     private let playContextCache: PlayContextCache?
     private let mediaWarmupManager: PlayerMediaWarmupManager?
     private let previewMuted: Bool
     private let castContext: LivingCastContext?
     private let startTimeOverride: Int?
-    private let startTimeOverrideContentIdentity: String
+    private var usesInitialStartTimeOverride = true
     private var videoDetail: VideoDetail?
     private var cancellable = Set<AnyCancellable>()
     private var loadTask: Task<Void, Never>?
@@ -62,7 +68,7 @@ class VideoPlayerViewModel {
         self.mediaWarmupManager = mediaWarmupManager
         self.previewMuted = previewMuted
         self.startTimeOverride = startTimeOverride
-        startTimeOverrideContentIdentity = playInfo.contentIdentity
+        episodeNavigation = VideoEpisodeNavigation(current: playInfo, followsSeriesAutomatically: playMode == .regular)
     }
 
     var currentPlayInfo: PlayInfo {
@@ -70,7 +76,19 @@ class VideoPlayerViewModel {
     }
 
     func load() {
-        startLoad(for: playInfo)
+        startLoad(for: pendingPlayInfo ?? playInfo, selectedSectionID: pendingEpisodeSectionID)
+    }
+
+    func configureInitialEpisodes(detail: VideoDetail?, list: VideoEpisodeList?, preferredSectionID: String?) {
+        videoDetail = detail
+        episodeNavigation.update(list: list ?? detail.map(VideoEpisodeList.video) ?? VideoEpisodeList(),
+                                 current: playInfo, selectedSectionID: preferredSectionID)
+    }
+
+    func cancelEpisodeSwitch() {
+        cancelLoading()
+        pendingPlayInfo = nil
+        pendingEpisodeSectionID = nil
     }
 
     func cancelLoading() {
@@ -79,18 +97,18 @@ class VideoPlayerViewModel {
         loadGeneration += 1
     }
 
-    private func startLoad(for requestedPlayInfo: PlayInfo) {
+    private func startLoad(for requestedPlayInfo: PlayInfo, selectedSectionID: String? = nil) {
         loadTask?.cancel()
         loadGeneration += 1
         let generation = loadGeneration
         let task = Task { [weak self] in
             guard let self else { return }
-            await performLoad(for: requestedPlayInfo, generation: generation)
+            await performLoad(for: requestedPlayInfo, selectedSectionID: selectedSectionID, generation: generation)
         }
         loadTask = task
     }
 
-    private func performLoad(for requestedPlayInfo: PlayInfo, generation: Int) async {
+    private func performLoad(for requestedPlayInfo: PlayInfo, selectedSectionID: String?, generation: Int) async {
         defer {
             if loadGeneration == generation {
                 loadTask = nil
@@ -106,33 +124,71 @@ class VideoPlayerViewModel {
             guard !Task.isCancelled, loadGeneration == generation else { return }
 
             playInfo = resolvedPlayInfo
+            pendingPlayInfo = nil
+            pendingEpisodeSectionID = nil
             videoDetail = data.detail
+            episodeNavigation.update(list: data.episodeList ?? data.detail.map(VideoEpisodeList.video) ?? VideoEpisodeList(),
+                                     current: resolvedPlayInfo, selectedSectionID: selectedSectionID)
+            if playMode == .feedFlow, episodeNavigation.isFollowingSeries {
+                sequenceProvider?.clearTemporaryOverrides()
+                sequenceProvider?.pushTemporary(resolvedPlayInfo)
+            }
+            hasLoadedVideo = true
             BiliBiliUpnpDMR.shared.sendVideoSwitch(aid: resolvedPlayInfo.aid, cid: data.cid)
             cancellable.removeAll()
             let plugins = generatePlayerPlugin(data,
                                                playInfo: resolvedPlayInfo,
                                                danmuProvider: danmuProvider)
             guard !Task.isCancelled, loadGeneration == generation else { return }
+            onPlayInfoChanged?(resolvedPlayInfo)
             loadResult.send(.success(plugins))
         } catch is CancellationError {
             return
         } catch let err {
             guard !Task.isCancelled, loadGeneration == generation else { return }
-            loadResult.send(.failure(err.localizedDescription))
+            if selectedSectionID != nil, hasLoadedVideo {
+                onEpisodeSwitchFailure?(err.localizedDescription)
+            } else {
+                loadResult.send(.failure(err.localizedDescription))
+            }
         }
     }
 
     private func loadVideoInfo(for playInfo: PlayInfo) async throws -> (PlayInfo, PlayerDetailData) {
-        let resolvedPlayInfo = try await PlayInfoResolver.resolve(playInfo)
+        let (resolvedPlayInfo, episodes) = try await PlayInfoResolver.resolveWithEpisodes(playInfo, knownEpisodes: episodeNavigation.list)
         try Task.checkCancellation()
-        let data = try await fetchVideoData(for: resolvedPlayInfo)
+        var data: PlayerDetailData
+        do {
+            data = try await fetchVideoData(for: resolvedPlayInfo)
+        } catch {
+            try Task.checkCancellation()
+            guard !resolvedPlayInfo.isBangumi else { throw error }
+            let existing = videoDetail?.View.aid == resolvedPlayInfo.aid ? videoDetail : nil
+            let detail = await fetchVideoDetail(aid: resolvedPlayInfo.aid, existing: existing)
+            try Task.checkCancellation()
+            guard let epid = PlayInfoResolver.bangumiEpisodeID(in: detail) else { throw error }
+            var redirected = resolvedPlayInfo
+            redirected.epid = epid
+            return try await loadVideoInfo(for: redirected)
+        }
+        if !resolvedPlayInfo.isBangumi, let epid = PlayInfoResolver.bangumiEpisodeID(in: data.detail) {
+            var redirected = resolvedPlayInfo
+            redirected.epid = epid
+            return try await loadVideoInfo(for: redirected)
+        }
+        data.episodeList = episodes
         try Task.checkCancellation()
         return (resolvedPlayInfo, data)
     }
 
     private func fetchVideoDetail(aid: Int, existing: VideoDetail?) async -> VideoDetail? {
         if let existing { return existing }
-        return try? await WebRequest.requestDetailVideo(aid: aid)
+        do {
+            return try await WebRequest.requestDetailVideo(aid: aid)
+        } catch {
+            Logger.warn("视频详情加载失败 (aid=\(aid)): \(error.localizedDescription)")
+            return nil
+        }
     }
 
     private func fetchVideoData(for playInfo: PlayInfo) async throws -> PlayerDetailData {
@@ -157,8 +213,7 @@ class VideoPlayerViewModel {
             detail.playerStartPos = resolvedPlayerStartPos(cid: cached.cid,
                                                            duration: cached.videoPlayURLInfo.dash.duration,
                                                            lastPlayCid: lastPlayCid,
-                                                           playTimeInSecond: playTimeInSecond,
-                                                           playInfo: playInfo)
+                                                           playTimeInSecond: playTimeInSecond)
             return detail
         }
 
@@ -199,8 +254,7 @@ class VideoPlayerViewModel {
             detail.playerStartPos = resolvedPlayerStartPos(cid: cid,
                                                            duration: playData.dash.duration,
                                                            lastPlayCid: last_play_cid,
-                                                           playTimeInSecond: playTimeInSecond,
-                                                           playInfo: playInfo)
+                                                           playTimeInSecond: playTimeInSecond)
 
             return detail
 
@@ -215,20 +269,20 @@ class VideoPlayerViewModel {
         }
     }
 
-    private func updatePlayInfo(_ newPlayInfo: PlayInfo) {
-        playInfo = newPlayInfo
-        onPlayInfoChanged?(newPlayInfo)
-        startLoad(for: newPlayInfo)
+    private func updatePlayInfo(_ newPlayInfo: PlayInfo, selectedSectionID: String? = nil) {
+        usesInitialStartTimeOverride = false
+        pendingPlayInfo = newPlayInfo
+        pendingEpisodeSectionID = selectedSectionID
+        startLoad(for: newPlayInfo, selectedSectionID: selectedSectionID)
     }
 
     private func resolvedPlayerStartPos(cid: Int,
                                         duration: Int,
                                         lastPlayCid: Int,
-                                        playTimeInSecond: Int,
-                                        playInfo: PlayInfo) -> Int?
+                                        playTimeInSecond: Int) -> Int?
     {
         if let startTimeOverride,
-           startTimeOverrideContentIdentity == playInfo.contentIdentity
+           usesInitialStartTimeOverride
         {
             return min(max(0, startTimeOverride), max(0, duration - 1))
         }
@@ -247,24 +301,73 @@ class VideoPlayerViewModel {
 
     func playNextFromSequence() async -> Bool {
         guard let next = await sequenceProvider?.moveNext() else { return false }
+        episodeNavigation.leaveSeries()
         updatePlayInfo(next)
         return true
     }
 
     func playPreviousFromSequence() async -> Bool {
         guard let previous = sequenceProvider?.movePrevious() else { return false }
+        episodeNavigation.leaveSeries()
         updatePlayInfo(previous)
         return true
     }
 
     func playTemporaryOverride(_ temporaryPlayInfo: PlayInfo) {
         guard temporaryPlayInfo.sequenceKey != currentPlayInfo.sequenceKey else { return }
+        episodeNavigation.leaveSeries()
         sequenceProvider.map { provider in
             MainActor.assumeIsolated {
                 provider.pushTemporary(temporaryPlayInfo)
             }
         }
         updatePlayInfo(temporaryPlayInfo)
+    }
+
+    private func selectEpisode(_ selection: VideoEpisodeList.Selection) {
+        guard let info = episodeNavigation.list.item(for: selection) else {
+            Logger.warn("选集位置无效: \(selection.sectionID), index=\(selection.index)")
+            onEpisodeSwitchFailure?("所选剧集已不可用，请重新打开选集列表。")
+            return
+        }
+        let section = episodeNavigation.list.sections.first { $0.id == selection.sectionID }
+        guard section?.index(of: playInfo) != selection.index else { return }
+        updatePlayInfo(info, selectedSectionID: selection.sectionID)
+    }
+
+    private func playNextInCurrentContext() async -> Bool {
+        if episodeNavigation.isFollowingSeries {
+            guard let next = episodeNavigation.next else { return false }
+            updatePlayInfo(next, selectedSectionID: episodeNavigation.activeSectionID)
+            return true
+        }
+        return await playNextFromSequence()
+    }
+
+    private func restartCurrentContext() -> Bool {
+        if episodeNavigation.isFollowingSeries {
+            guard let first = episodeNavigation.first,
+                  episodeNavigation.activeSection?.index(of: playInfo) != 0
+            else { return false }
+            updatePlayInfo(first, selectedSectionID: episodeNavigation.activeSectionID)
+            return true
+        }
+        guard let sequenceProvider, sequenceProvider.count > 1 else { return false }
+        sequenceProvider.reset()
+        guard let first = sequenceProvider.current() else { return false }
+        updatePlayInfo(first)
+        return true
+    }
+
+    private func reloadEpisodeList() async throws -> VideoEpisodeList {
+        let generation = loadGeneration
+        let current = playInfo
+        let detail = try await WebRequest.requestDetailVideo(aid: current.aid)
+        try Task.checkCancellation()
+        guard generation == loadGeneration else { throw CancellationError() }
+        videoDetail = detail
+        episodeNavigation.update(list: .video(detail), current: current)
+        return episodeNavigation.list
     }
 
     func preloadNeighborsIfNeeded() async {
@@ -314,15 +417,33 @@ class VideoPlayerViewModel {
             danmu?.danMuView.playingSpeed = speed.value
         }.store(in: &cancellable)
 
-        let playlist = VideoPlayListPlugin(sequenceProvider: sequenceProvider)
+        let playlist = VideoPlayListPlugin(episodes: episodeNavigation.list,
+                                           currentPlayInfo: playInfo,
+                                           preferredSectionID: episodeNavigation.activeSectionID,
+                                           episodeLoadFailed: data.detail == nil && data.episodeList == nil && !episodeNavigation.list.hasChoices)
+        playlist.navigation = { [weak self] in
+            guard let self else { return (nil, false) }
+            if episodeNavigation.isFollowingSeries {
+                return (episodeNavigation.next, true)
+            }
+            return (sequenceProvider?.peekNext(), false)
+        }
         playlist.onPlayEnd = { [weak self] in
             guard self?.playMode == .regular else { return }
             self?.onExit?()
         }
-        playlist.onPlayNextWithInfo = {
-            [weak self] info in
-            guard let self else { return }
-            updatePlayInfo(info)
+        playlist.onPlayNext = { [weak self] in
+            await self?.playNextInCurrentContext() ?? false
+        }
+        playlist.onRestart = { [weak self] in
+            self?.restartCurrentContext() ?? false
+        }
+        playlist.onSelectEpisode = { [weak self] selection in
+            self?.selectEpisode(selection)
+        }
+        playlist.onReloadEpisodes = { [weak self] in
+            guard let self else { throw CancellationError() }
+            return try await reloadEpisodeList()
         }
         playlist.onShowCurrentDetail = { [weak self] info in
             self?.onShowDetail?(info)

@@ -170,6 +170,8 @@ class VideoPlayerViewController: CommonPlayerViewController {
     }
 
     var data: VideoDetail?
+    var episodeList: VideoEpisodeList?
+    var preferredEpisodeSectionID: String?
     var sequenceProvider: VideoSequenceProvider?
     var onLoadFailure: ((String) -> Void)?
     var onPlaybackStarted: (() -> Void)?
@@ -227,11 +229,15 @@ class VideoPlayerViewController: CommonPlayerViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         viewModel.sequenceProvider = sequenceProvider
+        viewModel.configureInitialEpisodes(detail: data, list: episodeList, preferredSectionID: preferredEpisodeSectionID)
         viewModel.onPlayInfoChanged = { [weak self] info in
             self?.handlePlayInfoChanged(info)
         }
         viewModel.onShowDetail = { [weak self] info in
             self?.showDetail(for: info)
+        }
+        viewModel.onEpisodeSwitchFailure = { [weak self] message in
+            self?.showEpisodeSwitchFailure(message: message)
         }
         viewModel.loadResult.receive(on: DispatchQueue.main).sink { [weak self] result in
             switch result {
@@ -381,6 +387,19 @@ class VideoPlayerViewController: CommonPlayerViewController {
         present(alert, animated: true)
     }
 
+    private func showEpisodeSwitchFailure(message: String) {
+        Logger.warn("剧集切换失败: \(message)")
+        guard presentedViewController == nil else { return }
+        let alert = UIAlertController(title: "切换剧集失败", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "重试", style: .default) { [weak self] _ in
+            self?.viewModel.retryCurrent()
+        })
+        alert.addAction(UIAlertAction(title: "继续当前视频", style: .cancel) { [weak self] _ in
+            self?.viewModel.cancelEpisodeSwitch()
+        })
+        present(alert, animated: true)
+    }
+
     private func showDetail(for info: PlayInfo) {
         guard playMode != .preview else { return }
         let detailVC: VideoDetailViewController
@@ -393,7 +412,7 @@ class VideoPlayerViewController: CommonPlayerViewController {
     }
 
     @objc private func handleDoubleUpTap() {
-        guard playMode == .feedFlow else { return }
+        guard playMode == .feedFlow, presentedViewController == nil else { return }
         Logger.debug("[FeedFlow] 捕获双击上键，准备切换至上一条")
         Task { [weak self] in
             guard let self else { return }
@@ -402,7 +421,7 @@ class VideoPlayerViewController: CommonPlayerViewController {
     }
 
     @objc private func handleDoubleDownTap() {
-        guard playMode == .feedFlow else { return }
+        guard playMode == .feedFlow, presentedViewController == nil else { return }
         Logger.debug("[FeedFlow] 捕获双击下键，准备切换至下一条")
         Task { [weak self] in
             guard let self else { return }
@@ -413,6 +432,7 @@ class VideoPlayerViewController: CommonPlayerViewController {
     @available(tvOS 11.0, *)
     @objc private func handleSystemFocusUpdate(_ note: Notification) {
         guard playMode == .feedFlow,
+              presentedViewController == nil,
               let context = note.userInfo?[UIFocusSystem.focusUpdateContextUserInfoKey] as? UIFocusUpdateContext,
               let nextView = context.nextFocusedView
         else { return }
@@ -515,6 +535,7 @@ class VideoPlayerViewController: CommonPlayerViewController {
 
     private func handleFocusedInfoAction(title: String) {
         guard playMode == .feedFlow,
+              presentedViewController == nil,
               let action = AutoTriggeredInfoAction(title: title)
         else { return }
 
