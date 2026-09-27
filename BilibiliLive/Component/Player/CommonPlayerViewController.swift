@@ -364,6 +364,9 @@ final class PlayerDiagnosticRecorder {
     private var lastPosition: Double?
     private var clockAdvanced = false
     private var stopped = false
+    #if DEBUG
+    private var diagnosticVideoOutput: AVPlayerItemVideoOutput?
+    #endif
 
     init(player: AVPlayer, viewController: AVPlayerViewController) {
         self.viewController = viewController
@@ -372,6 +375,13 @@ final class PlayerDiagnosticRecorder {
             DispatchQueue.main.async { [weak self] in self?.sample("display-ready") }
         })
         item = player.currentItem
+        #if DEBUG
+        if let item, ProcessInfo.processInfo.arguments.contains("-PlaybackFrameDiagnostics") {
+            let output = AVPlayerItemVideoOutput(pixelBufferAttributes: nil)
+            item.add(output)
+            diagnosticVideoOutput = output
+        }
+        #endif
         observations.append(player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
             DispatchQueue.main.async { [weak self] in self?.sample("time-control") }
         })
@@ -404,6 +414,10 @@ final class PlayerDiagnosticRecorder {
         observations.removeAll()
         notifications.forEach { NotificationCenter.default.removeObserver($0) }
         notifications.removeAll()
+        #if DEBUG
+        if let diagnosticVideoOutput { item?.remove(diagnosticVideoOutput) }
+        diagnosticVideoOutput = nil
+        #endif
     }
 
     deinit { stop() }
@@ -414,6 +428,15 @@ final class PlayerDiagnosticRecorder {
         let position = item.currentTime().seconds
         let buffer = VideoBufferingController.bufferedSeconds(in: item.loadedTimeRanges.map(\.timeRangeValue), at: position)
         if trigger == "tick" {
+            #if DEBUG
+            if player.timeControlStatus == .playing, let output = diagnosticVideoOutput {
+                let time = item.currentTime()
+                var displayTime = CMTime.invalid
+                let frame = output.hasNewPixelBuffer(forItemTime: time)
+                    ? output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: &displayTime) : nil
+                Logger.info("[playback-frame] id=\(id) position=\(position) fresh=\(frame != nil) framePosition=\(displayTime.seconds) width=\(frame.map(CVPixelBufferGetWidth) ?? 0) height=\(frame.map(CVPixelBufferGetHeight) ?? 0)")
+            }
+            #endif
             if !clockAdvanced, player.timeControlStatus == .playing,
                let lastPosition, position > lastPosition + 0.1 {
                 clockAdvanced = true

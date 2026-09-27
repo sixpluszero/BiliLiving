@@ -8,8 +8,8 @@ enum VideoBufferDuration: Int, Codable, CaseIterable {
     var title: String {
         switch self {
         case .standard: return "30 秒"
-        case .extended: return "2 分钟（推荐）"
-        case .maximum: return "5 分钟"
+        case .extended: return "2 分钟"
+        case .maximum: return "5 分钟（质量优先）"
         }
     }
 }

@@ -89,6 +89,9 @@ enum PlaybackDiagnostics {
         for _ in 0..<5 {
             guard let value = current else { break }
             parts.append("\(value.domain)(\(value.code)): \(sanitize(value.localizedDescription))")
+            if let reason = value.localizedFailureReason {
+                parts.append("reason=\(sanitize(reason))")
+            }
             current = value.userInfo[NSUnderlyingErrorKey] as? NSError
         }
         return parts.joined(separator: " <- ")

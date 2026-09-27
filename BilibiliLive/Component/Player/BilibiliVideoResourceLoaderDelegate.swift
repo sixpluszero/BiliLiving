@@ -25,12 +25,13 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         let info: VideoPlayURLInfo.DashInfo.DashMediaInfo
         let url: String
         let duration: Int
+        var isIFrame = false
     }
 
     private var audioPlaylist = ""
     private var videoPlaylist = ""
     private var backupVideoPlaylist = ""
-    private var masterPlaylist = ""
+    private(set) var masterPlaylist = ""
 
     private let badRequestErrorCode = 455
 
@@ -48,6 +49,8 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
     private var hasSubtitle = false
     private var hasPreferSubtitleAdded = false
     private var httpServer = HttpServer()
+    private var segmentCacheServer: VideoSegmentCacheServer?
+    private var usesProactiveBuffering = false
     let diagnosticID = String(UUID().uuidString.prefix(8))
     private var aid = 0
     private(set) var httpPort = 0
@@ -61,13 +64,22 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
     private var resolvedMediaURLs = [VideoPlayURLInfo.DashInfo.DashMediaInfo: String]()
     private var lastVideoHost: String?
     private var lastAudioHost: String?
+    private var hasUncachedFallback = false
     private(set) var startupProbeResults = [CDNDiagnostics.ProbeResult]()
+    var cacheSnapshot: VideoSegmentCacheSnapshot? {
+        diagnosticsLock.lock()
+        let uncached = hasUncachedFallback
+        diagnosticsLock.unlock()
+        return uncached ? nil : segmentCacheServer?.monitor.value
+    }
     var currentSegmentHost: String? {
+        if let host = cacheSnapshot?.videoHost { return host }
         diagnosticsLock.lock()
         defer { diagnosticsLock.unlock() }
         return lastVideoHost
     }
     var currentAudioHost: String? {
+        if let host = cacheSnapshot?.audioHost { return host }
         diagnosticsLock.lock()
         defer { diagnosticsLock.unlock() }
         return lastAudioHost
@@ -97,7 +109,7 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         diagnosticsLock.lock()
         let resolvedURL = resolvedMediaURLs[stream.info]
         diagnosticsLock.unlock()
-        return StreamDiagnostics(host: resolvedURL.flatMap { URLComponents(string: $0)?.host },
+        return StreamDiagnostics(host: cacheSnapshot?.videoHost ?? resolvedURL.flatMap { URLComponents(string: $0)?.host },
                                  candidates: Self.uniqueHostURLs(stream.info.playableURLs),
                                  bandwidth: stream.info.bandwidth, codec: stream.info.codecs)
     }
@@ -108,6 +120,12 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         resolvedMediaURLs[info] = url
         if (info.width ?? 0) > 0 { lastVideoHost = URLComponents(string: url)?.host }
         else { lastAudioHost = URLComponents(string: url)?.host }
+    }
+
+    private func recordUncachedFallback() {
+        diagnosticsLock.lock()
+        hasUncachedFallback = true
+        diagnosticsLock.unlock()
     }
     /// 播放中途检测到当前 host 吞吐撑不住时，外部（BVideoPlayPlugin）指定的优先 host，
     /// sidx 探测会把它排到候选队首，覆盖默认 URL 顺序
@@ -169,9 +187,6 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         var framerate = info.frame_rate ?? "25"
         if isHDR10 {
             videoRange = "PQ"
-            if let value = Double(framerate), value <= 30 {} else {
-                framerate = "30"
-            }
         }
         if codecs == "dvh1.08.07" || codecs == "dvh1.08.03" {
             supplementCodesc = codecs + "/db4h"
@@ -229,7 +244,7 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         }
     }
 
-    private func getVideoPlayList(info: PlaybackInfo) async -> String {
+    private func getVideoPlayList(info: PlaybackInfo) async throws -> String {
         let sidxResult = await segmentInfoCache.sidx(from: info.info, preferredHost: preferredHost)
         let inits = info.info.segment_base.initialization.components(separatedBy: "-")
         guard let moovIdxStr = inits.last,
@@ -239,8 +254,12 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
               var offset = Int(offsetStr),
               let sidxResult = sidxResult
         else {
-            recordSelectedURL(info.url, for: info.info)
-            Logger.warn("[media-map] id=\(diagnosticID) aid=\(aid) qn=\(info.info.id) codec=\(info.info.codecs) sidx-unavailable; falling back to whole-file duration=\(info.duration) resource=\(PlaybackDiagnostics.resource(info.url))")
+            recordUncachedFallback()
+            let fallbackURL = preferredHost.flatMap { host in
+                info.info.playableURLs.first { URLComponents(string: $0)?.host == host }
+            } ?? info.url
+            recordSelectedURL(fallbackURL, for: info.info)
+            Logger.warn("[media-map] id=\(diagnosticID) aid=\(aid) qn=\(info.info.id) codec=\(info.info.codecs) sidx-unavailable; falling back to whole-file duration=\(info.duration) resource=\(PlaybackDiagnostics.resource(fallbackURL))")
             return """
             #EXTM3U
             #EXT-X-VERSION:7
@@ -249,7 +268,7 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
             #EXT-X-INDEPENDENT-SEGMENTS
             #EXT-X-PLAYLIST-TYPE:VOD
             #EXTINF:\(info.duration)
-            \(info.url)
+            \(fallbackURL)
             #EXT-X-ENDLIST
             """
         }
@@ -260,6 +279,50 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         let segmentURL = sidxResult.url
         Logger.info("[media-map] id=\(diagnosticID) aid=\(aid) qn=\(info.info.id) codec=\(info.info.codecs) size=\(info.info.width ?? 0)x\(info.info.height ?? 0) preferredHost=\(preferredHost ?? "-") actualResource=\(PlaybackDiagnostics.resource(segmentURL)) segments=\(segment.segments.count) maxSegmentSeconds=\(segment.maxSegmentDuration() ?? 0) bandwidth=\(info.info.bandwidth)")
         recordSelectedURL(segmentURL, for: info.info)
+        if let segmentCacheServer {
+            guard let trackIndex = videoInfo.firstIndex(where: { $0.info == info.info }),
+                  let initializationStart = Int(moovOffset),
+                  initializationStart >= 0, moovIdx >= initializationStart, moovIdx < Int.max,
+                  segment.timescale > 0, segment.firstOffset >= 0,
+                  offset < Int.max - segment.firstOffset else {
+                throw VideoSegmentCache.CacheError.invalidTrack
+            }
+            let trackID = String(trackIndex)
+            var fragments = [VideoSegmentCache.Segment(range: initializationStart..<(moovIdx + 1),
+                                                        start: 0, duration: 0)]
+            var mediaOffset = offset + 1 + segment.firstOffset
+            var time = 0.0
+            for entry in segment.segments {
+                guard entry.type == 0, entry.size > 0, entry.duration > 0,
+                      mediaOffset <= Int.max - entry.size else {
+                    throw VideoSegmentCache.CacheError.invalidTrack
+                }
+                let duration = Double(entry.duration) / Double(segment.timescale)
+                fragments.append(.init(range: mediaOffset..<(mediaOffset + entry.size), start: time, duration: duration))
+                mediaOffset += entry.size
+                time += duration
+            }
+            let isVideo = (info.info.width ?? 0) > 0
+            let isPrimary = isVideo || videoInfo.first(where: { ($0.info.width ?? 0) == 0 })?.info == info.info
+            let urls = Self.uniqueHostURLs([segmentURL] + info.info.playableURLs).compactMap(URL.init(string:))
+            try await segmentCacheServer.cache.register(.init(id: trackID, isVideo: isVideo, isPrimary: isPrimary,
+                mimeType: info.info.mime_type, urls: urls, segments: fragments))
+            var playlist = """
+            #EXTM3U
+            #EXT-X-VERSION:7
+            #EXT-X-TARGETDURATION:\(segment.maxSegmentDuration() ?? info.duration)
+            #EXT-X-MEDIA-SEQUENCE:1
+            #EXT-X-INDEPENDENT-SEGMENTS
+            #EXT-X-PLAYLIST-TYPE:VOD
+            #EXT-X-MAP:URI="\(segmentCacheServer.url(track: trackID, index: 0, isPreview: info.isIFrame))"
+
+            """
+            for (index, fragment) in fragments.enumerated() where index > 0 {
+                playlist += "#EXTINF:\(fragment.duration),\n\(segmentCacheServer.url(track: trackID, index: index, isPreview: info.isIFrame))\n"
+            }
+            playlist += "#EXT-X-ENDLIST\n"
+            return playlist
+        }
         var playList = """
         #EXTM3U
         #EXT-X-VERSION:7
@@ -374,23 +437,39 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         playlists.append(playList)
     }
 
-    func setBilibili(info: VideoPlayURLInfo, subtitles: [SubtitleData], aid: Int, maxQuality: Int? = nil, streamIndex: Int? = nil, preferredHost: String? = nil, preferences: PlayerMediaPreferences = .current) {
+    func setBilibili(info: VideoPlayURLInfo, subtitles: [SubtitleData], aid: Int, maxQuality: Int? = nil, streamIndex: Int? = nil, preferredHost: String? = nil, preferences: PlayerMediaPreferences = .current) throws {
         playInfo = info
         self.aid = aid
         self.preferredHost = preferredHost
+        usesProactiveBuffering = preferences.proactiveBuffering
+        hasUncachedFallback = false
         reset()
+        for stream in info.dash.video {
+            let playable = PlayerMediaPreferences.isPlayable(stream)
+            Logger.info("[media-format] id=\(diagnosticID) aid=\(aid) qn=\(stream.id) codec=\(stream.codecs) size=\(stream.width ?? 0)x\(stream.height ?? 0) fps=\(stream.frame_rate ?? "-") bandwidth=\(stream.bandwidth) mimePlayable=\(playable)")
+        }
         hasSubtitle = subtitles.count > 0
-        let videos = preferences.selectVideos(from: info.dash.video,
+        var videos = preferences.selectVideos(from: info.dash.video,
                                               maxQuality: maxQuality,
                                               streamIndex: streamIndex,
-                                              excluding: videoCodecBlackList)
+                                              excluding: videoCodecBlackList,
+                                              isPlayable: PlayerMediaPreferences.isPlayable)
+        guard !videos.isEmpty else {
+            throw "此设备不支持所选视频编码，且没有相同分辨率和帧率的兼容来源。请手动选择其他清晰度。"
+        }
+        Logger.info("[media-selection] id=\(diagnosticID) requestedQuality=\(maxQuality ?? preferences.quality.qn) selectedQuality=\(videos[0].id) codec=\(videos[0].codecs) size=\(videos[0].width ?? 0)x\(videos[0].height ?? 0) fps=\(videos[0].frame_rate ?? "-")")
 
+        // Loopback throughput must not make AVPlayer switch codecs based on
+        // disk speed. Keep the selected quality and prefer its efficient codec.
+        if usesProactiveBuffering, let selected = videos.first(where: { $0.isHevc }) ?? videos.first {
+            videos = [selected]
+        }
         collectCDNCandidates(from: videos.first)
 
         // 添加所有 CDN 节点的 URL，让 AVPlayer 自动选择最快的
         // 这样可以解决单个 CDN 节点速度慢的问题
         for video in videos {
-            for url in video.playableURLs {
+            for url in usesProactiveBuffering ? Array(video.playableURLs.prefix(1)) : video.playableURLs {
                 addVideoPlayBackInfo(info: video, url: url, duration: info.dash.duration)
             }
         }
@@ -429,14 +508,15 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
             }
         }
 
-        // i-frame
-        if let video = videos.last, let url = video.playableURLs.first {
+        // SIDX describes full GOPs, not I-frame-only byte ranges. Advertising
+        // those as a cached preview rendition can make its failures stop video.
+        if !usesProactiveBuffering, let video = videos.last, let url = video.playableURLs.first {
             let media = """
             #EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=\(Self.peakBandwidth(forAverage: video.bandwidth)),RESOLUTION=\(video.width!)x\(video.height!),URI="\(URLs.customDashPrefix)\(videoInfo.count)"
 
             """
             masterPlaylist.append(media)
-            videoInfo.append(PlaybackInfo(info: video, url: url, duration: info.dash.duration))
+            videoInfo.append(PlaybackInfo(info: video, url: url, duration: info.dash.duration, isIFrame: true))
         }
 
         masterPlaylist.append("\n#EXT-X-ENDLIST\n")
@@ -444,12 +524,34 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         Logger.debug("masterPlaylist: \(masterPlaylist)")
     }
 
-    func selectPreferredCDNIfNeeded() async {
-        guard preferredHost == nil else { return }
-        startupProbeResults = await CDNDiagnostics.probeForStartup(urls: cdnCandidates)
-        preferredHost = CDNDiagnostics.ranked(startupProbeResults).first { $0.endToEndMbps != nil }?.host
-            ?? (cdnCandidates.count == 1 ? cdnCandidates.first.flatMap { URLComponents(string: $0)?.host } : nil)
-        Logger.info("[cdn-selected] id=\(diagnosticID) aid=\(aid) host=\(preferredHost ?? "none") probe=first-video-256KB")
+    func selectPreferredCDNIfNeeded() async throws {
+        if preferredHost == nil {
+            startupProbeResults = await CDNDiagnostics.probeForStartup(urls: cdnCandidates)
+            preferredHost = CDNDiagnostics.ranked(startupProbeResults).first { $0.endToEndMbps != nil }?.host
+                ?? (cdnCandidates.count == 1 ? cdnCandidates.first.flatMap { URLComponents(string: $0)?.host } : nil)
+            Logger.info("[cdn-selected] id=\(diagnosticID) aid=\(aid) host=\(preferredHost ?? "none") probe=first-video-256KB")
+        }
+        if usesProactiveBuffering, segmentCacheServer == nil {
+            segmentCacheServer = try VideoSegmentCacheServer(
+                headers: ["User-Agent": Keys.userAgent, "Referer": Keys.referer(for: aid)],
+                diagnosticID: diagnosticID)
+        }
+    }
+
+    func prepareCachedPlayback(at position: Double, target: Double, maximumWait: TimeInterval = 30) async throws {
+        guard let segmentCacheServer else { return }
+        let primary = [videoInfo.first(where: { ($0.info.width ?? 0) > 0 }),
+                       videoInfo.first(where: { ($0.info.width ?? 0) == 0 })].compactMap { $0 }
+        for info in primary {
+            _ = try await getVideoPlayList(info: info)
+            try Task.checkCancellation()
+        }
+        try await segmentCacheServer.cache.prebuffer(at: position, target: target, maximumWait: maximumWait)
+    }
+
+    func updateCachedPlayback(at position: Double, target: Double) {
+        guard let cache = segmentCacheServer?.cache else { return }
+        Task { await cache.updatePosition(position, target: target) }
     }
 
     func prewarmPrimaryVideoIndex() async {
@@ -458,6 +560,7 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
     }
 
     func cancelPendingIndexLoads() {
+        segmentCacheServer?.stop()
         let cache = segmentInfoCache
         Task {
             await cache.cancelAll()
@@ -512,8 +615,13 @@ private extension BilibiliVideoResourceLoaderDelegate {
         if urlStr.hasPrefix(URLs.customDashPrefix), let index = Int(customUrl.lastPathComponent) {
             let info = videoInfo[index]
             Task {
-                report(loadingRequest, content: await getVideoPlayList(info: info))
+                do { report(loadingRequest, content: try await getVideoPlayList(info: info)) }
+                catch {
+                    Logger.warn("[media-map] playlist failed: \(PlaybackDiagnostics.error(error))")
+                    loadingRequest.finishLoading(with: error)
+                }
             }
+            return
         }
         if urlStr.hasPrefix(URLs.customSubtitlePrefix) {
             let url = String(urlStr.dropFirst(URLs.customSubtitlePrefix.count))

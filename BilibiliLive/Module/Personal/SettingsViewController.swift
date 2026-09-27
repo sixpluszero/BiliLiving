@@ -176,7 +176,9 @@ class SettingsViewController: UIViewController {
             }
 
             SectionModel(title: "音视频") {
-                Actions(title: "视频预缓冲", message: "提前加载后续内容，减少跨境网络波动造成的卡顿。更长缓冲会增加流量和内存占用；实际长度由系统与网速决定。下次播放生效。",
+                Toggle(title: "质量优先预缓存", setting: Settings.videoProactiveBuffering,
+                       onChange: Settings.videoProactiveBuffering.toggle())
+                Actions(title: "视频预缓冲", message: "开启质量优先预缓存时持续下载后续分片，最多使用 1 GB 临时磁盘空间；起播前最多等待 30 秒积累缓存，不自动降低画质。关闭后由系统管理缓冲。下次播放生效。",
                         current: Settings.videoBufferDuration.title,
                         options: VideoBufferDuration.allCases,
                         optionString: VideoBufferDuration.allCases.map(\.title))

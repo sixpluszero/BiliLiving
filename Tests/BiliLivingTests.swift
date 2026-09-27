@@ -6,6 +6,234 @@ import CocoaAsyncSocket
 @testable import BilibiliLive
 
 final class BiliLivingTests: XCTestCase {
+    func testSegmentCacheValidatesRemoteAndLocalByteRanges() throws {
+        let url = try XCTUnwrap(URL(string: "https://example.invalid/media"))
+        let valid = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 206, httpVersion: nil,
+                                                 headerFields: ["Content-Range": "bytes 4-7/100"]))
+        XCTAssertEqual(try VideoSegmentCache.validateResponse(valid, bytes: 4, range: 4..<8), 100)
+        XCTAssertThrowsError(try VideoSegmentCache.validateResponse(valid, bytes: 3, range: 4..<8))
+        XCTAssertThrowsError(try VideoSegmentCache.validateResponse(valid, bytes: 4, range: 0..<4))
+        XCTAssertThrowsError(try VideoSegmentCache.validateResponse(valid, bytes: 4, range: 4..<8, totalSize: 101))
+        let ignored = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil))
+        XCTAssertThrowsError(try VideoSegmentCache.validateResponse(ignored, bytes: 4, range: 4..<8))
+        XCTAssertEqual(try VideoSegmentCache.responseRange(nil, length: 10), 0..<10)
+        XCTAssertEqual(try VideoSegmentCache.responseRange("bytes=2-5", length: 10), 2..<6)
+        XCTAssertEqual(try VideoSegmentCache.responseRange("bytes=8-", length: 10), 8..<10)
+        XCTAssertEqual(try VideoSegmentCache.responseRange("bytes=-3", length: 10), 7..<10)
+        XCTAssertEqual(try VideoSegmentCache.responseRange("bytes=8-100", length: 10), 8..<10)
+        for invalid in ["bytes=10-", "bytes=5-2", "bytes=0-1,3-4", "bytes=-0", "bytes=x-y"] {
+            XCTAssertThrowsError(try VideoSegmentCache.responseRange(invalid, length: 10))
+        }
+    }
+
+    func testSegmentCachePrefetchesWithoutPlayerRequestsAndServesDiskHits() async throws {
+        let origin = try SegmentCacheTestOrigin()
+        let monitor = VideoSegmentCacheMonitor()
+        let cache = try VideoSegmentCache(headers: [:], diagnosticID: "prefetch-test", monitor: monitor)
+        addTeardownBlock { await cache.stop(); origin.stop() }
+        try await cache.register(origin.track())
+        try await cache.prebuffer(at: 0, target: 20, minimum: 20, maximumWait: 3)
+        XCTAssertGreaterThanOrEqual(monitor.value.bufferedSeconds, 20)
+        XCTAssertEqual(monitor.value.misses, 0, "Prefetch must not wait for an AVPlayer request")
+        let before = origin.requestCount
+        let response = try await cache.response(track: "video", index: 2, rangeHeader: nil)
+        XCTAssertEqual(response.data, origin.payload.subdata(in: 8..<12))
+        XCTAssertEqual(origin.requestCount, before, "The complete fragment must come from disk")
+        XCTAssertGreaterThan(monitor.value.hits, 0)
+        XCTAssertLessThanOrEqual(origin.maximumActiveRequests, 4)
+    }
+
+    func testSegmentCacheRejectsTruncatedCDNAndRetriesSameFragment() async throws {
+        let broken = try SegmentCacheTestOrigin(truncated: true)
+        let healthy = try SegmentCacheTestOrigin()
+        let monitor = VideoSegmentCacheMonitor()
+        let cache = try VideoSegmentCache(headers: [:], diagnosticID: "failover-test", monitor: monitor)
+        addTeardownBlock { await cache.stop(); broken.stop(); healthy.stop() }
+        try await cache.register(broken.track(urls: [broken.url, healthy.url]))
+        let response = try await cache.response(track: "video", index: 3, rangeHeader: nil)
+        XCTAssertEqual(response.data, healthy.payload.subdata(in: 12..<16))
+        XCTAssertEqual(broken.requestCount, 1)
+        XCTAssertEqual(healthy.requestCount, 1)
+        let cached = try await cache.response(track: "video", index: 3, rangeHeader: "bytes=1-2")
+        XCTAssertEqual(cached.status, 206)
+        XCTAssertEqual(cached.headers["Content-Range"], "bytes 1-2/4")
+        XCTAssertEqual(cached.data, healthy.payload.subdata(in: 13..<15))
+        XCTAssertEqual(healthy.requestCount, 1)
+        XCTAssertEqual(monitor.value.storedBytes, 4, "Never cache the truncated body")
+    }
+
+    func testSegmentCacheRejectsIgnoredRangeAndRetriesAlternate() async throws {
+        let broken = try SegmentCacheTestOrigin(ignoresRange: true)
+        let healthy = try SegmentCacheTestOrigin()
+        let monitor = VideoSegmentCacheMonitor()
+        let cache = try VideoSegmentCache(headers: [:], diagnosticID: "ignored-range-test", monitor: monitor)
+        addTeardownBlock { await cache.stop(); broken.stop(); healthy.stop() }
+        try await cache.register(broken.track(urls: [broken.url, healthy.url]))
+        let response = try await cache.response(track: "video", index: 3, rangeHeader: nil)
+        XCTAssertEqual(response.data, healthy.payload.subdata(in: 12..<16))
+        XCTAssertEqual(monitor.value.storedBytes, 4)
+        XCTAssertEqual(broken.requestCount, 1)
+        XCTAssertEqual(healthy.requestCount, 1)
+    }
+
+    func testSegmentCacheCoalescesRequestsAndCancelsOnStop() async throws {
+        let origin = try SegmentCacheTestOrigin(delay: 0.2)
+        let monitor = VideoSegmentCacheMonitor()
+        let cache = try VideoSegmentCache(headers: [:], diagnosticID: "coalesce-test", monitor: monitor)
+        addTeardownBlock { await cache.stop(); origin.stop() }
+        try await cache.register(origin.track())
+        async let first = cache.response(track: "video", index: 2, rangeHeader: nil)
+        async let second = cache.response(track: "video", index: 2, rangeHeader: nil)
+        let values = try await [first, second]
+        XCTAssertEqual(values[0].data, values[1].data)
+        XCTAssertEqual(origin.requestCount, 1)
+        let pending = Task { try await cache.response(track: "video", index: 5, rangeHeader: nil) }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        await cache.stop()
+        do {
+            _ = try await pending.value
+            XCTFail("Stopped playback must cancel outstanding media requests")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Unexpected cancellation error: \(error)")
+        }
+        XCTAssertEqual(monitor.value.activeDownloads, 0)
+        XCTAssertEqual(monitor.value.storedBytes, 0)
+    }
+
+    func testSegmentCacheBoundsDiskUsageAndRefillsAfterSeek() async throws {
+        let origin = try SegmentCacheTestOrigin()
+        let monitor = VideoSegmentCacheMonitor()
+        let cache = try VideoSegmentCache(headers: [:], diagnosticID: "budget-test", monitor: monitor, maximumBytes: 20)
+        addTeardownBlock { await cache.stop(); origin.stop() }
+        try await cache.register(origin.track())
+        try await cache.prebuffer(at: 0, target: 20, minimum: 20, maximumWait: 3)
+        XCTAssertEqual(monitor.value.storedBytes, 20)
+        try await cache.prebuffer(at: 30, target: 20, minimum: 15, maximumWait: 3)
+        XCTAssertGreaterThanOrEqual(monitor.value.bufferedSeconds, 15)
+        XCTAssertLessThanOrEqual(monitor.value.storedBytes, 20)
+        let sought = try await cache.response(track: "video", index: 7, rangeHeader: nil)
+        XCTAssertEqual(sought.data, origin.payload.subdata(in: 28..<32))
+    }
+
+    func testSegmentCacheWarmupHonorsWaitingBudget() async throws {
+        let origin = try SegmentCacheTestOrigin(delay: 0.6)
+        let cache = try VideoSegmentCache(headers: [:], diagnosticID: "deadline-test")
+        addTeardownBlock { await cache.stop(); origin.stop() }
+        try await cache.register(origin.track())
+        let start = ProcessInfo.processInfo.systemUptime
+        try await cache.prebuffer(at: 0, target: 60, minimum: 30, maximumWait: 0.05)
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 0.5,
+                          "A slow connection must not make the extra startup wait unbounded")
+    }
+
+    func testSegmentCacheDoesNotCountFragmentsBeyondAHole() async throws {
+        let origin = try SegmentCacheTestOrigin(failingOffset: 8)
+        let monitor = VideoSegmentCacheMonitor()
+        let cache = try VideoSegmentCache(headers: [:], diagnosticID: "hole-test", monitor: monitor)
+        addTeardownBlock { await cache.stop(); origin.stop() }
+        try await cache.register(origin.track())
+        try await cache.prebuffer(at: 0, target: 20, minimum: 20, maximumWait: 0.5)
+        XCTAssertEqual(monitor.value.bufferedSeconds, 5, accuracy: 0.01)
+        XCTAssertGreaterThan(monitor.value.storedBytes, 8, "Later downloaded fragments must not hide the missing one")
+    }
+
+    func testSegmentCacheRequiresAudioAsWellAsVideo() async throws {
+        let video = try SegmentCacheTestOrigin()
+        let audio = try SegmentCacheTestOrigin(truncated: true)
+        let monitor = VideoSegmentCacheMonitor()
+        let cache = try VideoSegmentCache(headers: [:], diagnosticID: "audio-test", monitor: monitor)
+        addTeardownBlock { await cache.stop(); video.stop(); audio.stop() }
+        try await cache.register(video.track())
+        try await cache.register(.init(id: "audio", isVideo: false, isPrimary: true, mimeType: "audio/mp4",
+                                       urls: [audio.url], segments: audio.track().segments))
+        try await cache.prebuffer(at: 0, target: 20, minimum: 20, maximumWait: 0.5)
+        XCTAssertEqual(monitor.value.bufferedSeconds, 0)
+        XCTAssertGreaterThan(monitor.value.storedBytes, 0, "Video alone is not continuous playable buffer")
+    }
+
+    func testSegmentCachePrioritizesPlaybackOverPreviewRequests() async throws {
+        let origin = try SegmentCacheTestOrigin(delay: 0.2)
+        let cache = try VideoSegmentCache(headers: [:], diagnosticID: "priority-test", concurrency: 1)
+        addTeardownBlock { await cache.stop(); origin.stop() }
+        try await cache.register(origin.track())
+        let preview = Task { try await cache.response(track: "video", index: 18, rangeHeader: nil, isPreview: true) }
+        try await eventually { origin.requestCount == 1 }
+        let playback = try await cache.response(track: "video", index: 1, rangeHeader: nil)
+        XCTAssertEqual(playback.data, origin.payload.subdata(in: 4..<8))
+        XCTAssertEqual(Array(origin.requestedOffsets.prefix(2)), [72, 4])
+        let previewData = try await preview.value.data
+        XCTAssertEqual(previewData, origin.payload.subdata(in: 72..<76))
+    }
+
+    func testSegmentCacheLoopbackServerServesRangesAndHead() async throws {
+        let origin = try SegmentCacheTestOrigin()
+        let server = try VideoSegmentCacheServer(headers: [:], diagnosticID: "http-test")
+        addTeardownBlock { server.stop(); origin.stop() }
+        try await server.cache.register(origin.track())
+        let url = try XCTUnwrap(URL(string: server.url(track: "video", index: 2)))
+        XCTAssertEqual(url.host, "127.0.0.1")
+        var request = URLRequest(url: url)
+        request.setValue("bytes=1-2", forHTTPHeaderField: "Range")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 206)
+        XCTAssertEqual(data, origin.payload.subdata(in: 9..<11))
+        request.httpMethod = "HEAD"
+        let (headData, head) = try await URLSession.shared.data(for: request)
+        XCTAssertTrue(headData.isEmpty)
+        XCTAssertEqual((head as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Length"), "2")
+        XCTAssertEqual(origin.requestCount, 1)
+    }
+
+    func testSegmentCacheResumesLargeFragmentWithoutRedownloadingVerifiedPrefix() async throws {
+        let chunk = VideoSegmentCache.downloadChunkBytes
+        let origin = try SegmentCacheTestOrigin(payloadBytes: 4 + chunk * 3, failOnceAt: 4 + chunk)
+        let monitor = VideoSegmentCacheMonitor()
+        let cache = try VideoSegmentCache(headers: [:], diagnosticID: "resume-chunk-test", monitor: monitor)
+        addTeardownBlock { await cache.stop(); origin.stop() }
+        try await cache.register(origin.largeTrack())
+        do {
+            _ = try await cache.response(track: "video", index: 1, rangeHeader: nil)
+            XCTFail("A truncated second chunk must not be served as a complete fragment")
+        } catch {
+            XCTAssertEqual(monitor.value.storedBytes, chunk, "Keep the already validated prefix on disk")
+        }
+        let response = try await cache.response(track: "video", index: 1, rangeHeader: nil)
+        XCTAssertEqual(response.data, origin.payload.subdata(in: 4..<origin.payload.count))
+        XCTAssertEqual(origin.requestedOffsets.filter { $0 == 4 }.count, 1, "Retry the failed chunk, not the entire GOP")
+        XCTAssertEqual(origin.requestedOffsets.filter { $0 == 4 + chunk }.count, 2)
+        XCTAssertEqual(monitor.value.storedBytes, chunk * 3)
+    }
+
+    func testSegmentCacheLargeFragmentCanTakeLongerThanFifteenSeconds() async throws {
+        let chunk = VideoSegmentCache.downloadChunkBytes
+        let origin = try SegmentCacheTestOrigin(payloadBytes: 4 + chunk * 4, secondsPerChunk: 4.1)
+        let cache = try VideoSegmentCache(headers: [:], diagnosticID: "large-slow-fragment-test")
+        addTeardownBlock { await cache.stop(); origin.stop() }
+        try await cache.register(origin.largeTrack())
+        let start = ProcessInfo.processInfo.systemUptime
+        let response = try await cache.response(track: "video", index: 1, rangeHeader: nil)
+        XCTAssertGreaterThan(ProcessInfo.processInfo.systemUptime - start, 15)
+        XCTAssertEqual(response.data, origin.payload.subdata(in: 4..<origin.payload.count))
+        XCTAssertEqual(origin.requestCount, 4, "Small verified ranges must survive a slow multi-megabyte fragment")
+    }
+
+    func testSegmentCacheStreamsVerifiedPrefixBeforeFragmentCompletes() async throws {
+        let chunk = VideoSegmentCache.downloadChunkBytes
+        let origin = try SegmentCacheTestOrigin(payloadBytes: 4 + chunk * 3, secondsPerChunk: 0.4)
+        let server = try VideoSegmentCacheServer(headers: [:], diagnosticID: "streaming-test")
+        let client = URLSession(configuration: .ephemeral)
+        addTeardownBlock { client.invalidateAndCancel(); server.stop(); origin.stop() }
+        try await server.cache.register(origin.largeTrack())
+        let url = try XCTUnwrap(URL(string: server.url(track: "video", index: 1)))
+        let (bytes, response) = try await client.bytes(from: url)
+        XCTAssertEqual((response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Length"), "\(chunk * 3)")
+        var iterator = bytes.makeAsyncIterator()
+        let first = try await iterator.next()
+        XCTAssertEqual(first, origin.payload[4])
+        XCTAssertLessThan(origin.requestCount, 3, "The player must receive data before the entire fragment is downloaded")
+    }
+
     func testPlaybackDiagnosticsRedactsSignedURLsAndPreservesErrorChain() {
         let url = "https://user:password@cdn.example/video.m4s?token=secret&deadline=123#fragment"
         XCTAssertEqual(PlaybackDiagnostics.resource(url), "https://cdn.example/video.m4s")
@@ -70,6 +298,17 @@ final class BiliLivingTests: XCTestCase {
             state.recordRateChange(rate: 0, reason: reason.rawValue)
             XCTAssertTrue(state.isPaused, "Do not restart playback over a system interruption")
         }
+    }
+
+    func testIncompatibleFormatErrorsAreNotNetworkRecoveryCandidates() {
+        for code in [AVError.Code.incompatibleAsset, .noCompatibleAlternatesForExternalDisplay,
+                     .decoderNotFound, .formatUnsupported] {
+            XCTAssertNotNil(BVideoPlayPlugin.incompatiblePlaybackMessage(
+                NSError(domain: AVFoundationErrorDomain, code: code.rawValue)))
+        }
+        XCTAssertNil(BVideoPlayPlugin.incompatiblePlaybackMessage(NSError(domain: NSURLErrorDomain, code: -1001)))
+        XCTAssertNil(BVideoPlayPlugin.incompatiblePlaybackMessage(NSError(domain: "CoreMediaErrorDomain", code: -19602)))
+        XCTAssertNil(BVideoPlayPlugin.incompatiblePlaybackMessage(nil))
     }
 
     @MainActor func testFailedToEndIsHandledOnceWithoutFailedItemStatus() throws {
@@ -205,6 +444,29 @@ final class BiliLivingTests: XCTestCase {
         XCTAssertEqual(Settings.mediaQuality, .quality_2160p)
     }
 
+    func testProactiveCacheDefaultsPreserveExistingBufferChoiceAndSeparateWarmupKeys() {
+        let keys = ["Settings.videoBufferDuration", "Settings.videoProactiveBuffering"]
+        let oldValues = keys.map { UserDefaults.standard.object(forKey: $0) }
+        defer {
+            for (key, value) in zip(keys, oldValues) {
+                if let value { UserDefaults.standard.set(value, forKey: key) }
+                else { UserDefaults.standard.removeObject(forKey: key) }
+            }
+        }
+        keys.forEach { UserDefaults.standard.removeObject(forKey: $0) }
+        XCTAssertEqual(Settings.videoBufferDuration, .maximum)
+        XCTAssertTrue(Settings.videoProactiveBuffering)
+        Settings.videoBufferDuration = .extended
+        XCTAssertEqual(Settings.videoBufferDuration.rawValue, 120)
+        let cached = PlayerMediaPreferences.current
+        Settings.videoProactiveBuffering = false
+        let native = PlayerMediaPreferences.current
+        XCTAssertFalse(native.proactiveBuffering)
+        XCTAssertNotEqual(PlayerMediaWarmupManager.CacheKey(sequenceKey: "same", preferences: cached),
+                          PlayerMediaWarmupManager.CacheKey(sequenceKey: "same", preferences: native))
+        XCTAssertEqual(Settings.videoBufferDuration.rawValue, 120)
+    }
+
     func testQualitySelectionHonors4KAndBestAvailable() throws {
         func stream(_ quality: Int, _ codec: String, _ bandwidth: Int) -> VideoPlayURLInfo.DashInfo.DashMediaInfo {
             .init(id: quality, base_url: "https://example.invalid/video.m4s", backup_url: nil,
@@ -228,6 +490,58 @@ final class BiliLivingTests: XCTestCase {
         XCTAssertNotEqual(PlayerMediaWarmupManager.CacheKey(sequenceKey: "same-video", preferences: fourK),
                           PlayerMediaWarmupManager.CacheKey(sequenceKey: "same-video", preferences: best),
                           "Changing defaults must not reuse a warmed asset at the old quality")
+    }
+
+    func testDeviceCodecFallbackPreservesResolutionAndFrameRate() {
+        func stream(_ quality: Int, codec: String, width: Int = 3840, height: Int = 2160,
+                    fps: String = "59.933") -> VideoPlayURLInfo.DashInfo.DashMediaInfo {
+            .init(id: quality, base_url: "https://example.invalid/video.m4s", backup_url: nil,
+                  bandwidth: 19_000_000, mime_type: "video/mp4", codecs: codec,
+                  width: width, height: height, frame_rate: fps, sar: nil, start_with_sap: nil,
+                  segment_base: .init(initialization: "0-100", index_range: "101-200"), codecid: nil)
+        }
+        let avc4K = stream(120, codec: "avc1.640034")
+        let hevcHDR = stream(125, codec: "hvc1.2.4.L153.90")
+        let lower = stream(116, codec: "avc1.640032", width: 1920, height: 1080)
+        let streams = [hevcHDR, avc4K, lower]
+        let preferences = PlayerMediaPreferences(quality: .quality_2160p, preferAVC: true, losslessAudio: false)
+        let compatible: (VideoPlayURLInfo.DashInfo.DashMediaInfo) -> Bool = { $0.codecs != "avc1.640034" }
+        XCTAssertEqual(preferences.selectVideos(from: streams, isPlayable: compatible).map(\.id), [125],
+                       "Use supported 4K60 HDR instead of unsupported 4K60 AVC")
+        XCTAssertEqual(preferences.selectVideos(from: streams, isPlayable: { _ in true }).map(\.id), [120],
+                       "Do not change a supported SDR choice")
+        XCTAssertTrue(preferences.selectVideos(from: [avc4K, lower], isPlayable: compatible).isEmpty,
+                      "Do not silently lower resolution when the selected codec is incompatible")
+        let slowerHDR = stream(125, codec: "hvc1.2.4.L153.90", fps: "30")
+        XCTAssertTrue(preferences.selectVideos(from: [avc4K, slowerHDR], isPlayable: compatible).isEmpty,
+                      "Do not silently halve the frame rate")
+        XCTAssertTrue(preferences.selectVideos(from: streams, streamIndex: 1, isPlayable: compatible).isEmpty,
+                      "Explicit incompatible codec choices must fail, not silently switch")
+        let fractionalHDR = stream(125, codec: "hvc1.2.4.L153.90", fps: "60000/1001")
+        XCTAssertEqual(preferences.selectVideos(from: [avc4K, fractionalHDR], isPlayable: compatible).map(\.id), [125])
+    }
+
+    @MainActor func testReportedVideoSDRHEVCNegotiation() async throws {
+        // Public regression source that offered incompatible AVC 4K60 on the
+        // first-generation TV. Run on-device to retain its existing entitlements.
+        for (name, flags, preferredCodec) in [
+            ("regular", 976, 0),
+            ("sdr-hevc", 144, 1),
+            ("dash-hevc", 16, 1),
+            ("all-hevc", 4048, 1),
+        ] {
+            let info: VideoPlayURLInfo = try await WebRequest.request(
+                url: WebRequest.EndPoint.playUrl,
+                parameters: ["avid": 117332567397550, "cid": 42200205797,
+                             "qn": 120, "fnver": 0, "fnval": flags, "fourk": 1,
+                             "prefer_codec_type": preferredCodec, "otype": "json"])
+            XCTAssertFalse(info.dash.video.isEmpty)
+            let candidates = info.dash.video.filter { $0.id >= 116 }
+            for stream in candidates {
+                Logger.info("[codec-negotiation] request=\(name) fnval=\(flags) qn=\(stream.id) codec=\(stream.codecs) size=\(stream.width ?? 0)x\(stream.height ?? 0) fps=\(stream.frame_rate ?? "-") bandwidth=\(stream.bandwidth) mimePlayable=\(PlayerMediaPreferences.isPlayable(stream))")
+            }
+            Logger.info("[codec-negotiation] request=\(name) has4KSDRHEVC=\(candidates.contains { $0.id == 120 && $0.isHevc && ($0.width ?? 0) >= 3840 })")
+        }
     }
 
     @MainActor func testFollowUsesVerifiedStateAndPreservesStateOnFailure() async throws {
@@ -328,13 +642,20 @@ final class BiliLivingTests: XCTestCase {
     }
     @MainActor func testLivePlaybackQualitySwitchAndPausePreservation() async throws {
         let previousBuffer = Settings.videoBufferDuration
+        let previousPrefetch = Settings.videoProactiveBuffering
         Settings.videoBufferDuration = .extended
-        defer { Settings.videoBufferDuration = previousBuffer }
+        Settings.videoProactiveBuffering = true
+        defer {
+            Settings.videoBufferDuration = previousBuffer
+            Settings.videoProactiveBuffering = previousPrefetch
+        }
         let hot = try await WebRequest.requestHotVideo(page: 1)
-        let video = try XCTUnwrap(hot.list.first)
+        let video = try XCTUnwrap(hot.list.first { $0.duration > 120 })
         let info = try await WebRequest.requestPlayUrl(aid: video.aid, cid: video.cid)
         XCTAssertFalse(info.dash.video.isEmpty)
-        let detail = PlayerDetailData(aid: video.aid, cid: video.cid, epid: nil, seasonId: nil, subType: nil, videoPlayURLInfo: info)
+        let initialPosition = min(40, info.dash.duration / 4)
+        var detail = PlayerDetailData(aid: video.aid, cid: video.cid, epid: nil, seasonId: nil, subType: nil, videoPlayURLInfo: info)
+        detail.playerStartPos = initialPosition
         let container = CommonPlayerViewController()
         let window = try XCTUnwrap(AppDelegate.shared.window)
         let original = window.rootViewController
@@ -346,18 +667,47 @@ final class BiliLivingTests: XCTestCase {
         let playerVC = try XCTUnwrap(container.children.first as? AVPlayerViewController)
         defer { container.stopPlayback(); window.rootViewController = original }
         for _ in 0..<200 {
-            if (playerVC.player?.currentTime().seconds ?? 0) > 2 { break }
+            if playerVC.player?.timeControlStatus == .playing,
+               (playerVC.player?.currentTime().seconds ?? 0) > Double(initialPosition + 2) { break }
             try await Task.sleep(nanoseconds: 200_000_000)
         }
         let player = try XCTUnwrap(playerVC.player)
         XCTAssertEqual(player.currentItem?.status, .readyToPlay)
-        XCTAssertGreaterThan(player.currentTime().seconds, 2, "Real video time must advance")
+        XCTAssertGreaterThan(player.currentTime().seconds, Double(initialPosition + 2), "Resume at the prebuffered position")
         try await eventually {
             guard let item = player.currentItem else { return false }
             return VideoBufferingController.bufferedSeconds(
                 in: item.loadedTimeRanges.map(\.timeRangeValue), at: player.currentTime().seconds) > 20
         }
-        XCTAssertEqual(player.currentItem?.preferredForwardBufferDuration, 120)
+        XCTAssertEqual(player.currentItem?.preferredForwardBufferDuration, 30,
+                       "A large disk window must not force the same-sized native memory buffer")
+        let cachedDelegate = try XCTUnwrap((player.currentItem?.asset as? AVURLAsset)?.resourceLoader.delegate
+            as? BilibiliVideoResourceLoaderDelegate)
+        try await eventually(timeout: 30) {
+            (cachedDelegate.cacheSnapshot?.bufferedSeconds ?? 0) > 60
+        }
+        XCTAssertEqual(cachedDelegate.cacheSnapshot?.targetSeconds, 120)
+        XCTAssertGreaterThanOrEqual(cachedDelegate.cacheSnapshot?.position ?? 0, Double(initialPosition))
+        XCTAssertGreaterThan(cachedDelegate.cacheSnapshot?.storedBytes ?? 0, 0)
+        XCTAssertGreaterThan(cachedDelegate.cacheSnapshot?.hits ?? 0, 0, "AVPlayer must actually consume cached fragments")
+        XCTAssertFalse(cachedDelegate.masterPlaylist.contains("#EXT-X-I-FRAME-STREAM-INF"),
+                       "Full GOPs are not a valid I-frame-only rendition")
+        let item = try XCTUnwrap(player.currentItem)
+        let videoOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: nil)
+        item.add(videoOutput)
+        defer { item.remove(videoOutput) }
+        var lastFrameTime = -1.0
+        for _ in 0..<4 {
+            try await Task.sleep(nanoseconds: 1_000_000_000)
+            let time = player.currentTime()
+            XCTAssertTrue(videoOutput.hasNewPixelBuffer(forItemTime: time), "A moving playback clock is not proof of moving video")
+            var frameTime = CMTime.invalid
+            let frame = videoOutput.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: &frameTime)
+            XCTAssertNotNil(frame, "The decoder must provide a new video frame")
+            XCTAssertGreaterThan(frameTime.seconds, lastFrameTime)
+            XCTAssertEqual(frameTime.seconds, time.seconds, accuracy: 1)
+            lastFrameTime = frameTime.seconds
+        }
         if let item = player.currentItem {
             print("Verified forward buffer: \(VideoBufferingController.bufferedSeconds(in: item.loadedTimeRanges.map(\.timeRangeValue), at: player.currentTime().seconds))s")
         }
@@ -941,6 +1291,96 @@ final class BiliLivingTests: XCTestCase {
         throw NSError(domain: "CastingTest", code: 1)
     }
 
+}
+
+private final class SegmentCacheTestOrigin: @unchecked Sendable {
+    let payload: Data
+    private let server = HttpServer()
+    private let lock = NSLock()
+    private var count = 0
+    private var active = 0
+    private var maximumActive = 0
+    private var offsets = [Int]()
+    private var hasFailedOnce = false
+    private var port = 0
+
+    var url: URL { URL(string: "http://127.0.0.1:\(port)/media")! }
+    var requestCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+    var maximumActiveRequests: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return maximumActive
+    }
+    var requestedOffsets: [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return offsets
+    }
+
+    init(truncated: Bool = false, delay: TimeInterval = 0, failingOffset: Int? = nil,
+         ignoresRange: Bool = false, payloadBytes: Int = 128, failOnceAt: Int? = nil,
+         secondsPerChunk: TimeInterval = 0) throws {
+        payload = Data((0..<payloadBytes).map { UInt8($0 % 251) })
+        server.listenAddressIPv4 = "127.0.0.1"
+        server["/media"] = { [weak self] request in
+            guard let self else { return .notFound() }
+            self.lock.lock()
+            self.count += 1
+            self.active += 1
+            self.maximumActive = max(self.maximumActive, self.active)
+            if let start = request.headers["range"]?.dropFirst(6).split(separator: "-").first.flatMap({ Int($0) }) {
+                self.offsets.append(start)
+            }
+            self.lock.unlock()
+            defer {
+                self.lock.lock()
+                self.active -= 1
+                self.lock.unlock()
+            }
+            if delay > 0 { Thread.sleep(forTimeInterval: delay) }
+            if ignoresRange { return .ok(.data(self.payload, contentType: "video/mp4")) }
+            do {
+                let range = try VideoSegmentCache.responseRange(request.headers["range"], length: self.payload.count)
+                if secondsPerChunk > 0 {
+                    Thread.sleep(forTimeInterval: secondsPerChunk * Double(range.count) / Double(VideoSegmentCache.downloadChunkBytes))
+                }
+                self.lock.lock()
+                let failOnce = !self.hasFailedOnce && range.lowerBound == failOnceAt
+                if failOnce { self.hasFailedOnce = true }
+                self.lock.unlock()
+                let requested = self.payload.subdata(in: range)
+                let data = truncated || range.lowerBound == failingOffset || failOnce ? Data(requested.dropLast()) : requested
+                return .raw(206, "Partial Content",
+                            ["Content-Type": "video/mp4", "Content-Length": "\(data.count)",
+                             "Content-Range": "bytes \(range.lowerBound)-\(range.upperBound - 1)/\(self.payload.count)"],
+                            { try $0.write(data) })
+            } catch { return .badRequest(.text(error.localizedDescription)) }
+        }
+        try server.start(0, forceIPv4: true)
+        port = try server.port()
+    }
+
+    func track(urls: [URL]? = nil) -> VideoSegmentCache.Track {
+        let initialization = VideoSegmentCache.Segment(range: 0..<4, start: 0, duration: 0)
+        let media = (0..<20).map {
+            VideoSegmentCache.Segment(range: (4 + $0 * 4)..<(8 + $0 * 4), start: Double($0) * 5, duration: 5)
+        }
+        return .init(id: "video", isVideo: true, isPrimary: true, mimeType: "video/mp4",
+                     urls: urls ?? [url], segments: [initialization] + media)
+    }
+
+    func largeTrack() -> VideoSegmentCache.Track {
+        .init(id: "video", isVideo: true, isPrimary: true, mimeType: "video/mp4", urls: [url],
+              segments: [.init(range: 0..<4, start: 0, duration: 0),
+                         .init(range: 4..<payload.count, start: 0, duration: 5)])
+    }
+
+    func stop() { server.stop() }
+    deinit { stop() }
 }
 
 private final class FailureRecoveryTestPlugin: NSObject, CommonPlayerPlugin {

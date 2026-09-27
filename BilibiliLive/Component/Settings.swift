@@ -39,8 +39,11 @@ enum Settings {
     @UserDefaultCodable("Settings.mediaPlayerSpeed", defaultValue: PlaySpeed.default)
     static var mediaPlayerSpeed: PlaySpeed
 
-    @UserDefaultCodable("Settings.videoBufferDuration", defaultValue: .extended)
+    @UserDefaultCodable("Settings.videoBufferDuration", defaultValue: .maximum)
     static var videoBufferDuration: VideoBufferDuration
+
+    @UserDefault("Settings.videoProactiveBuffering", defaultValue: true)
+    static var videoProactiveBuffering: Bool
 
     @UserDefaultCodable("Settings.danmuArea", defaultValue: .style_50)
     static var danmuArea: DanmuArea

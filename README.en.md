@@ -43,7 +43,7 @@ See the [testing notes](docs/TESTING.md) (Chinese) for implementation and verifi
 
 | | What you can do on your TV |
 | :--- | :--- |
-| 🌎 **More buffering for overseas viewing** | New 30-second, 2-minute, and 5-minute forward-buffer targets, defaulting to 2 minutes, give 4K and other high-bitrate videos more room to absorb network fluctuations when accessing Bilibili CDNs from the US and other overseas regions. |
+| 🌎 **Quality-first buffering for overseas viewing** | Proactively prefetch about 5 minutes of audio and video to disk by default, retry failed fragments on alternate CDNs, and retain the selected quality through network fluctuations. |
 | 📺 **Low-resolution cast, higher-quality TV playback** | When a phone sends only a plain DLNA 720p link, try to identify the original video and fetch available HD streams using the signed-in TV account, restoring quality controls and danmaku. |
 | 🛋 **Watch right away** | Browse, search, play videos, and enjoy danmaku without signing in. Account actions such as favoriting and following prompt for login when needed. |
 | 🎞 **A home screen for the couch** | Large artwork, a three-column video grid, and remote focus navigation. Signed-in viewers get account recommendations; guests get popular videos, with pagination and refresh. |
@@ -55,13 +55,13 @@ See the [testing notes](docs/TESTING.md) (Chinese) for implementation and verifi
 
 ### 4K and high-bitrate playback improvements for overseas networks
 
-Upstream already supports 4K, CDN probing, and switching CDNs when playback stalls. BiliLiving builds on that foundation by replacing the fixed 15-second forward-buffer target for regular continuous video playback with **30 seconds, 2 minutes, or 5 minutes**, defaulting to **2 minutes**. The extra buffer is intended to absorb brief throughput drops on cross-border connections, helping viewers in the US and other overseas regions avoid repeated buffering during high-bitrate playback.
+Upstream already supports 4K, CDN probing, and switching CDNs when playback stalls. BiliLiving adds **quality-first proactive segment caching**, targeting **5 minutes on disk** by default. Choose 30 seconds, 2 minutes, or 5 minutes; existing saved choices are preserved. Up to four downloads fetch upcoming audio and video, retrying failed fragments on alternate CDNs without rebuilding the entire player.
 
-- Adjust the target immediately under **播放设置 → 视频预缓冲** (Playback Settings → Video Buffer) in the player. Try 5 minutes on more variable connections.
-- Startup and seeking temporarily use a shorter buffer before restoring the longer target. Playback does not wait for the full 2 or 5 minutes to download.
-- A new “Best available” default and playlists limited to the selected quality reduce automatic downgrades after choosing a quality such as 4K.
+- Adjust the target immediately under **播放设置 → 视频预缓冲** (Playback Settings → Video Buffer). Disable **质量优先预缓存** under Settings → Audio/Video to return to native fetching.
+- Startup tries to accumulate 30 seconds of media with at most 30 seconds of additional prebuffer waiting, rather than waiting for all five minutes. AVPlayer's own forward-buffer target stays at or below 30 seconds; the larger disk reserve is capped at approximately 1 GB per playback.
+- Keep the selected resolution and frame rate, preferring HEVC at that quality. If the device rejects a codec, try compatible HEVC/HDR at the same resolution without reducing frame rate; otherwise report the incompatibility rather than silently lowering quality.
 
-These durations are targets requested from AVPlayer. Actual buffering depends on the system and network; sustained insufficient bandwidth can still cause stalls. See the [buffering strategy](docs/PLAYBACK-BUFFERING.md) (Chinese) for implementation and validation limits.
+This is temporary buffering, not offline downloading. Sustained insufficient delivery from all available CDNs can still cause stalls. See the [buffering strategy](docs/PLAYBACK-BUFFERING.md) (Chinese) for implementation and device-validation limits.
 
 ### Recover HD playback from a low-resolution phone cast link
 

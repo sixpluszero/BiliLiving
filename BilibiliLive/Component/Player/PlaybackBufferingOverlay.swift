@@ -15,6 +15,7 @@ struct PlaybackBufferingDetails {
     var audioHost: String?
     var candidates = [Candidate]()
     var lastError: String?
+    var cache: VideoSegmentCacheSnapshot?
 }
 
 /// Uses AVKit's public guide so the card stays above the native transport bar.
@@ -113,12 +114,18 @@ final class PlaybackBufferingOverlay: UIView {
             let buffered = VideoBufferingController.bufferedSeconds(
                 in: item.loadedTimeRanges.map(\.timeRangeValue), at: item.currentTime().seconds)
             var buffer = String(format: "连续缓冲 %.1f 秒 / 目标 %.0f 秒", buffered, item.preferredForwardBufferDuration)
-            if let observed = event?.observedBitrate, observed.isFinite, observed > 0 {
+            if details?.cache == nil, let observed = event?.observedBitrate, observed.isFinite, observed > 0 {
                 buffer += String(format: " · 播放器采样 %.1f Mbps", observed / 1_000_000)
             }
             lines.append(buffer)
         } else {
             lines.append("正在准备播放资源")
+        }
+        if let cache = details?.cache {
+            lines.append(String(format: "磁盘前向缓存 %.1f / %.0f 秒 · %.1f MB · %d 个下载",
+                                cache.bufferedSeconds, cache.targetSeconds,
+                                Double(cache.storedBytes) / 1_048_576, cache.activeDownloads))
+            lines.append("播放器读取本机缓存；本机读取速度不代表 CDN 网速")
         }
         let resource = event?.uri.flatMap(URL.init(string:)) ?? (item?.asset as? AVURLAsset)?.url
         let directHost = ["http", "https"].contains(resource?.scheme ?? "") ? resource?.host : nil
@@ -126,7 +133,7 @@ final class PlaybackBufferingOverlay: UIView {
         if let audioHost = details?.audioHost, audioHost != details?.videoHost {
             lines.append("音频服务器：\(audioHost)")
         }
-        if let address = event?.serverAddress { lines.append("最近连接 IP：\(address)") }
+        if details?.cache == nil, let address = event?.serverAddress { lines.append("最近连接 IP：\(address)") }
         if let reason = player?.reasonForWaitingToPlay {
             switch reason {
             case .toMinimizeStalls: lines.append("系统状态：等待足够缓冲")

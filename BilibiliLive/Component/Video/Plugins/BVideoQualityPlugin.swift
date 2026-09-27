@@ -18,7 +18,8 @@ class BVideoQualityPlugin: NSObject, CommonPlayerPlugin {
     func addMenuItems(current: inout [UIMenuElement]) -> [UIMenuElement] {
         let info = playData.videoPlayURLInfo
         let groups = Dictionary(grouping: info.dash.video.enumerated().filter {
-            $0.element.codecs.hasPrefix("avc") || $0.element.isHevc
+            ($0.element.codecs.hasPrefix("avc") || $0.element.isHevc)
+                && PlayerMediaPreferences.isPlayable($0.element)
         }, by: { $0.element.id })
         guard !groups.isEmpty else { return [] }
         var actions: [UIMenuElement] = [UIAction(title: "默认 · \(Settings.mediaQuality.desp)", state: selectedID == nil ? .on : .off) { [weak self] _ in

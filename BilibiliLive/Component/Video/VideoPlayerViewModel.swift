@@ -294,6 +294,7 @@ class VideoPlayerViewModel {
                                           reportWatchHistory: playMode != .preview,
                                           minimizeStalling: true,
                                           isMuted: playMode == .preview && previewMuted,
+                                          proactiveBuffering: playMode != .preview,
                                           mediaWarmupManager: playMode == .feedFlow ? mediaWarmupManager : nil)
         playplugin.onLoadFailure = { [weak self] message in
             self?.loadResult.send(.failure(message))

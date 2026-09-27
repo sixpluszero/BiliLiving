@@ -13,12 +13,15 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
 
     private weak var playerVC: AVPlayerViewController?
     private var playerDelegate: BilibiliVideoResourceLoaderDelegate?
+    private var preparingDelegate: BilibiliVideoResourceLoaderDelegate?
+    private var pendingCachePosition: Double?
     private var bufferingController: VideoBufferingController?
     private let playInfo: PlayInfo
     private let playData: PlayerDetailData
     private let reportWatchHistory: Bool
     private let minimizeStalling: Bool
     private let isMuted: Bool
+    private let proactiveBuffering: Bool
     private let mediaWarmupManager: PlayerMediaWarmupManager?
     private var currentQualityId: Int?
     private var hasAppliedStartPosition = false
@@ -39,6 +42,7 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     private var recoveryPhase: String?
     private var recoveryState = PlaybackRecoveryState()
     private var rateChangeObserver: NSObjectProtocol?
+    private var cacheTimeObserver: NSObjectProtocol?
     private weak var failedPlaybackItem: AVPlayerItem?
     private var lastPlaybackError: String?
     private var isPreparingMedia = false
@@ -60,6 +64,7 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
          reportWatchHistory: Bool = true,
          minimizeStalling: Bool = true,
          isMuted: Bool = false,
+         proactiveBuffering: Bool = true,
          mediaWarmupManager: PlayerMediaWarmupManager? = nil)
     {
         self.playInfo = playInfo
@@ -67,6 +72,7 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         self.reportWatchHistory = reportWatchHistory
         self.minimizeStalling = minimizeStalling
         self.isMuted = isMuted
+        self.proactiveBuffering = proactiveBuffering
         self.mediaWarmupManager = mediaWarmupManager
         currentQualityId = playData.videoPlayURLInfo.quality
     }
@@ -76,6 +82,9 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         cdnProbeTask?.cancel()
         recoveryTask?.cancel()
         if let rateChangeObserver { NotificationCenter.default.removeObserver(rateChangeObserver) }
+        if let cacheTimeObserver { NotificationCenter.default.removeObserver(cacheTimeObserver) }
+        playerDelegate?.cancelPendingIndexLoads()
+        preparingDelegate?.cancelPendingIndexLoads()
     }
 
     private var currentStream: BilibiliVideoResourceLoaderDelegate.StreamDiagnostics? {
@@ -83,26 +92,50 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
             return playerDelegate.streamDiagnostics(for: playerVC?.player?.currentItem?.accessLog()?.events.last?.uri)
         }
         guard let video = PlayerMediaPreferences.current.selectVideos(
-            from: playData.videoPlayURLInfo.dash.video, maxQuality: lastMaxQuality, streamIndex: lastStreamIndex
+            from: playData.videoPlayURLInfo.dash.video, maxQuality: lastMaxQuality, streamIndex: lastStreamIndex,
+            isPlayable: PlayerMediaPreferences.isPlayable
         ).first else { return nil }
         return .init(host: nil, candidates: BilibiliVideoResourceLoaderDelegate.uniqueHostURLs(video.playableURLs),
                      bandwidth: video.bandwidth, codec: video.codecs)
     }
 
+    private var nativeBufferTarget: Double {
+        guard minimizeStalling, proactiveBuffering else { return 15 }
+        let target = Double(Settings.videoBufferDuration.rawValue)
+        return playerDelegate?.cacheSnapshot == nil ? target : min(30, target)
+    }
+
+    private func updateCachePosition(player: AVPlayer) {
+        guard player.currentItem?.status == .readyToPlay else { return }
+        let time = player.currentTime().seconds
+        guard time.isFinite, time >= 0 else { return }
+        if let pendingCachePosition {
+            guard abs(time - pendingCachePosition) < 2 else { return }
+            self.pendingCachePosition = nil
+        }
+        playerDelegate?.updateCachedPlayback(at: time, target: Double(Settings.videoBufferDuration.rawValue))
+    }
+
     var bufferingDetails: PlaybackBufferingDetails? {
-        let stream = currentStream
+        let stream = preparingDelegate?.streamDiagnostics(for: nil) ?? currentStream
         let candidates = stream?.candidates ?? []
+        var cache = (preparingDelegate ?? playerDelegate)?.cacheSnapshot
+        if preparingDelegate == nil, let time = playerVC?.player?.currentTime().seconds,
+           time.isFinite, let snapshot = cache {
+            cache?.bufferedSeconds = max(0, snapshot.bufferedSeconds - max(0, time - snapshot.position))
+        }
         return PlaybackBufferingDetails(
-            phase: recoveryPhase ?? (isPreparingMedia ? "正在准备播放资源" : nil),
+            phase: recoveryPhase ?? (isPreparingMedia ? (cache == nil ? "正在准备播放资源" : "质量优先，正在提前缓存（最多 30 秒）") : nil),
             isPreparing: (isPreparingMedia || playerVC?.player?.currentItem?.status == .unknown) && !recoveryState.isPaused,
             isRecovering: recoveryTask != nil && !recoveryState.isPaused,
             videoHost: stream?.host,
-            audioHost: playerDelegate?.currentAudioHost,
+            audioHost: (preparingDelegate ?? playerDelegate)?.currentAudioHost,
             candidates: candidates.compactMap { url in
                 guard let host = URLComponents(string: url)?.host else { return nil }
                 return .init(host: host, isPCDN: BVideoUrlUtils.isPCDN(url), result: cdnResults[url])
             },
-            lastError: lastPlaybackError
+            lastError: lastPlaybackError ?? cache?.lastError,
+            cache: cache
         )
     }
 
@@ -118,6 +151,11 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         if !cdnProbeReport.isEmpty {
             lines.append(cdnProbeReport)
         }
+        if let cache = playerDelegate?.cacheSnapshot {
+            lines.append(String(format: "disk buffer: %.1fs / %.0fs, %.1f MB, downloads %d, hits %d / misses %d",
+                                cache.bufferedSeconds, cache.targetSeconds, Double(cache.storedBytes) / 1_048_576,
+                                cache.activeDownloads, cache.hits, cache.misses))
+        }
         return lines.joined(separator: "\n")
     }
 
@@ -131,7 +169,17 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         guard !hasAppliedStartPosition else { return }
         hasAppliedStartPosition = true
         if let playerStartPos = playData.playerStartPos {
-            player.seek(to: CMTime(seconds: Double(playerStartPos), preferredTimescale: 1), toleranceBefore: .zero, toleranceAfter: .zero)
+            player.seek(to: CMTime(seconds: Double(playerStartPos), preferredTimescale: 1),
+                        toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak player] _ in
+                DispatchQueue.main.async {
+                    guard let self, let player, self.playerVC?.player === player else { return }
+                    // A phone or plugin may supersede the initial seek.
+                    self.pendingCachePosition = nil
+                    self.updateCachePosition(player: player)
+                }
+            }
+        } else {
+            pendingCachePosition = nil
         }
     }
 
@@ -143,11 +191,18 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         bufferingController?.stop()
         guard let item = player.currentItem else { return }
         bufferingController = VideoBufferingController(
-            item: item, target: minimizeStalling ? Double(Settings.videoBufferDuration.rawValue) : 15)
+            item: item, target: nativeBufferTarget)
         lastStalls = 0
         lastDroppedFrames = 0
         stallUnhealthyStreak = 0
         if let rateChangeObserver { NotificationCenter.default.removeObserver(rateChangeObserver) }
+        if let cacheTimeObserver { NotificationCenter.default.removeObserver(cacheTimeObserver) }
+        cacheTimeObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemTimeJumped, object: item, queue: .main
+        ) { [weak self, weak player] _ in
+            guard let self, let player, self.playerVC?.player === player else { return }
+            self.updateCachePosition(player: player)
+        }
         rateChangeObserver = NotificationCenter.default.addObserver(
             forName: AVPlayer.rateDidChangeNotification, object: player, queue: .main
         ) { [weak self, weak player] note in
@@ -165,6 +220,7 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     }
 
     func playerWillSeek(player: AVPlayer) {
+        pendingCachePosition = nil
         bufferingController?.prepareForSeek()
     }
 
@@ -174,6 +230,8 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         stopNetworkLogging()
         if let rateChangeObserver { NotificationCenter.default.removeObserver(rateChangeObserver) }
         rateChangeObserver = nil
+        if let cacheTimeObserver { NotificationCenter.default.removeObserver(cacheTimeObserver) }
+        cacheTimeObserver = nil
         player.pause()
         player.replaceCurrentItem(with: nil)
     }
@@ -195,7 +253,8 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
                 UIAction(title: duration.title, state: Settings.videoBufferDuration == duration ? .on : .off) { [weak self] _ in
                     Settings.videoBufferDuration = duration
                     guard let self else { return }
-                    self.bufferingController?.updateTarget(self.minimizeStalling ? Double(duration.rawValue) : 15)
+                    self.bufferingController?.updateTarget(self.nativeBufferTarget)
+                    if let player = self.playerVC?.player { self.updateCachePosition(player: player) }
                     (self.playerVC?.parent as? CommonPlayerViewController)?.updateMenus()
                 }
             })
@@ -262,9 +321,13 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         let keepUp = item.isPlaybackLikelyToKeepUp
         let buffered = bufferedSeconds(of: item)
         let stallDelta = max(0, stalls - lastStalls)
-        Logger.info("playback host \(host) observed \(observed)Mbps indicated \(indicated)Mbps effective \(effective)Mbps stalls \(stalls)(+\(stallDelta)) dropped \(dropped)(+\(dropped - lastDroppedFrames)) serverChanges \(event?.numberOfServerAddressChanges ?? 0) tcs \(tcs.rawValue) wait \(waiting) keepUp \(keepUp) buffered \(String(format: "%.1f", buffered))s")
+        Logger.info("playback host \(host) observedSource=\(playerDelegate?.cacheSnapshot == nil ? "network" : "local-cache") observed \(observed)Mbps indicated \(indicated)Mbps effective \(effective)Mbps stalls \(stalls)(+\(stallDelta)) dropped \(dropped)(+\(dropped - lastDroppedFrames)) serverChanges \(event?.numberOfServerAddressChanges ?? 0) tcs \(tcs.rawValue) wait \(waiting) keepUp \(keepUp) buffered \(String(format: "%.1f", buffered))s")
         lastStalls = stalls
         lastDroppedFrames = dropped
+        updateCachePosition(player: player)
+        if let cache = playerDelegate?.cacheSnapshot {
+            Logger.info("[playback-cache] position=\(cache.position) buffered=\(cache.bufferedSeconds)s target=\(cache.targetSeconds)s bytes=\(cache.storedBytes) downloads=\(cache.activeDownloads) hits=\(cache.hits) misses=\(cache.misses) videoHost=\(cache.videoHost ?? "-") audioHost=\(cache.audioHost ?? "-")")
+        }
 
         checkStallHealth(stallDelta: stallDelta, buffered: buffered)
     }
@@ -292,6 +355,9 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     /// 只根据真实卡顿触发换源：正在 waiting，或本周期新增了 stall。
     /// 播放流畅时仅 observed < indicated 不触发——indicated 常是峰值，低一些完全正常。
     private func checkStallHealth(stallDelta: Int, buffered: Double) {
+        // Cached playback retries individual ranges without discarding already
+        // downloaded media. Terminal player failures still use item recovery.
+        guard playerDelegate?.cacheSnapshot == nil else { return }
         guard !isUserPaused, recoveryTask == nil, !isPreparingMedia else {
             stallUnhealthyStreak = 0
             return
@@ -321,6 +387,13 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         if let error { lastPlaybackError = PlaybackDiagnostics.error(error) }
         cancelRecovery()
         guard !recoveryState.isPaused else { return true }
+        if let message = Self.incompatiblePlaybackMessage(error) {
+            playerDelegate?.cancelPendingIndexLoads()
+            Logger.warn("[playback-recovery] incompatible format; CDN reload cannot help: \(lastPlaybackError ?? "unknown")")
+            guard let onLoadFailure else { return false }
+            onLoadFailure(message)
+            return true
+        }
         guard recoveryState.failureAttempts < 2 else {
             Logger.warn("[playback-recovery] retry limit reached: \(lastPlaybackError ?? "unknown")")
             guard let onLoadFailure else { return false }
@@ -329,6 +402,19 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         }
         scheduleRecovery(player: player, terminalFailure: true)
         return true
+    }
+
+    static func incompatiblePlaybackMessage(_ error: Error?) -> String? {
+        guard let error = error as NSError?, error.domain == AVFoundationErrorDomain else { return nil }
+        switch error.code {
+        case AVError.Code.noCompatibleAlternatesForExternalDisplay.rawValue:
+            return "当前电视连接不支持此视频的 HDR／帧率组合，换 CDN 无法解决。未自动降低清晰度；请检查电视的 HDR 与匹配内容设置，或手动选择兼容格式。"
+        case AVError.Code.incompatibleAsset.rawValue, AVError.Code.decoderNotFound.rawValue,
+             AVError.Code.formatUnsupported.rawValue:
+            return "此 Apple TV 无法播放当前编码或格式，换 CDN 无法解决。未自动降低清晰度；请手动选择兼容格式。"
+        default:
+            return nil
+        }
     }
 
     private func cancelRecovery() {
@@ -422,6 +508,8 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         _ = try ensureActiveLoad(generation)
         guard vc.player === newPlayer else { throw CancellationError() }
         guard sought else { throw "重连后无法恢复播放位置" }
+        pendingCachePosition = nil
+        updateCachePosition(player: newPlayer)
         if !recoveryState.isPaused { newPlayer.playImmediately(atRate: rate) }
     }
 
@@ -485,6 +573,10 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         loadTask?.cancel()
         loadTask = nil
         loadGeneration += 1
+        playerDelegate?.cancelPendingIndexLoads()
+        preparingDelegate?.cancelPendingIndexLoads()
+        preparingDelegate = nil
+        pendingCachePosition = nil
         playerDelegate = nil
         if tearingDown {
             playerVC = nil
@@ -534,15 +626,33 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         }
         let delegate = prepared.delegate
         let asset = prepared.asset
+        preparingDelegate = delegate
+        delegate.startupProbeResults.forEach { cdnResults[$0.url] = $0 }
+        defer {
+            if preparingDelegate === delegate { preparingDelegate = nil }
+            if playerDelegate !== delegate { delegate.cancelPendingIndexLoads() }
+        }
+        let cachePosition = isQualitySwitch
+            ? (recoverySource ?? playerVC.player)?.currentTime().seconds ?? 0
+            : Double(playData.playerStartPos ?? 0)
+        try await delegate.prepareCachedPlayback(at: max(0, cachePosition),
+                                                 target: Double(Settings.videoBufferDuration.rawValue),
+                                                 maximumWait: isQualitySwitch ? 0 : 30)
+        _ = try ensureActiveLoad(generation)
+        pendingCachePosition = delegate.cacheSnapshot == nil ? nil : cachePosition
+        playerDelegate?.cancelPendingIndexLoads()
         playerDelegate = delegate
         lastMaxQuality = maxQuality
         lastStreamIndex = streamIndex
-        delegate.startupProbeResults.forEach { cdnResults[$0.url] = $0 }
 
         // AVKit 不允许在同一场全屏播放里反复切换该属性，因此只在首次装配资源时计算一次。
         if !isQualitySwitch {
             playerVC.appliesPreferredDisplayCriteriaAutomatically = shouldApplyContentMatch(delegate: delegate)
         }
+        Logger.info("[playback-display] hdrEligible=\(AVPlayer.eligibleForHDRPlayback) automaticMatch=\(playerVC.appliesPreferredDisplayCriteriaAutomatically) matchingEnabled=\(AppDelegate.shared.window?.avDisplayManager.isDisplayCriteriaMatchingEnabled ?? false)")
+        #if DEBUG
+        Logger.info("[playback-display] hdrModes=\(AVPlayer.availableHDRModes.rawValue) maxRefreshRate=\(UIScreen.main.maximumFramesPerSecond)")
+        #endif
 
         await prepare(toPlay: asset, generation: generation, managePlaybackManually: isQualitySwitch)
     }
@@ -554,7 +664,7 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
                                preferredHost: String?,
                                isQualitySwitch: Bool) async throws -> PreparedPlayerMedia
     {
-        if !isQualitySwitch,
+        if proactiveBuffering, !isQualitySwitch,
            maxQuality == nil,
            streamIndex == nil,
            preferredHost == nil,
@@ -562,12 +672,15 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         {
             return try await mediaWarmupManager.preparedMedia(for: playInfo)
         }
+        var preferences = PlayerMediaPreferences.current
+        preferences.proactiveBuffering = preferences.proactiveBuffering && proactiveBuffering
         return try await PlayerMediaFactory.prepare(aid: playData.aid,
                                                     urlInfo: urlInfo,
                                                     playerInfo: playerInfo,
                                                     maxQuality: maxQuality,
                                                     streamIndex: streamIndex,
-                                                    preferredHost: preferredHost)
+                                                    preferredHost: preferredHost,
+                                                    preferences: preferences)
     }
 
     @MainActor
@@ -601,6 +714,8 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
                 Logger.warn("[quality] Failed to restore playback position")
                 return false
             }
+            pendingCachePosition = nil
+            updateCachePosition(player: newPlayer)
             currentQualityId = qualityId
             if shouldResume && !recoveryState.isPaused { newPlayer.playImmediately(atRate: previousRate) }
             else { newPlayer.pause() }
