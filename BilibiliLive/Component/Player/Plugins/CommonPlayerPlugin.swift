@@ -9,6 +9,7 @@ import AVKit
 import UIKit
 
 protocol CommonPlayerPlugin: NSObject {
+    var bufferingDetails: PlaybackBufferingDetails? { get }
     func addViewToPlayerOverlay(container: UIView)
     func addMenuItems(current: inout [UIMenuElement]) -> [UIMenuElement]
 
@@ -25,10 +26,12 @@ protocol CommonPlayerPlugin: NSObject {
     func playerDidStall(player: AVPlayer)
     func playerWillSeek(player: AVPlayer)
     func playerDidFail(player: AVPlayer)
+    func recoverPlayback(player: AVPlayer, error: Error?) -> Bool
     func playerDidCleanUp(player: AVPlayer)
 }
 
 extension CommonPlayerPlugin {
+    var bufferingDetails: PlaybackBufferingDetails? { nil }
     func addViewToPlayerOverlay(container: UIView) {}
     func addMenuItems(current: inout [UIMenuElement]) -> [UIMenuElement] { return [] }
 
@@ -39,6 +42,7 @@ extension CommonPlayerPlugin {
     func playerDidStall(player: AVPlayer) {}
     func playerWillSeek(player: AVPlayer) {}
     func playerDidFail(player: AVPlayer) {}
+    func recoverPlayback(player: AVPlayer, error: Error?) -> Bool { false }
     func playerDidCleanUp(player: AVPlayer) {}
 
     func playerDidLoad(playerVC: AVPlayerViewController) {}

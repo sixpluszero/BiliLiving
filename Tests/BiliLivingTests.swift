@@ -34,6 +34,152 @@ final class BiliLivingTests: XCTestCase {
         XCTAssertEqual(result.endToEndMbps ?? 0, 2.056, accuracy: 0.001)
     }
 
+    func testCDNRecoveryDoesNotTrustFastBodyOnFailingServer() {
+        let current = CDNDiagnostics.ProbeResult(url: "https://current.example/video", bytes: 262144,
+                                                transferTime: 0.01, setupTime: 0.03, error: nil, totalTime: 0.04)
+        let alternate = CDNDiagnostics.ProbeResult(url: "https://alternate.example/video", bytes: 262144,
+                                                  transferTime: 0.17, setupTime: 0.1, error: nil, totalTime: 0.27)
+        let failed = CDNDiagnostics.ProbeResult(url: "https://failed.example/video", bytes: 200,
+                                               transferTime: 0.001, setupTime: 0, error: "HTTP 403", totalTime: 0.001)
+        XCTAssertGreaterThan(current.mbps ?? 0, (alternate.mbps ?? 0) * 10)
+        XCTAssertEqual(CDNDiagnostics.recoveryCandidate(from: [current, failed, alternate],
+                                                       currentHost: current.host)?.host, alternate.host)
+        XCTAssertNil(CDNDiagnostics.recoveryCandidate(from: [current, failed], currentHost: current.host))
+
+        let highLatency = CDNDiagnostics.ProbeResult(url: "https://slow-setup.example/video", bytes: 262144,
+                                                    transferTime: 0.01, setupTime: 2, error: nil, totalTime: 2.01)
+        XCTAssertEqual(CDNDiagnostics.ranked([highLatency, alternate]).first?.host, alternate.host,
+                       "Startup ranking must include connection and first-byte wait")
+    }
+
+    func testPlaybackRecoverySeparatesSystemFailureFromPauseAndBoundsRetries() {
+        var state = BVideoPlayPlugin.PlaybackRecoveryState()
+        state.recordRateChange(rate: 1.5, reason: AVPlayer.RateDidChangeReason.setRateCalled.rawValue)
+        state.recordRateChange(rate: 0, reason: AVPlayer.RateDidChangeReason.setRateFailed.rawValue)
+        XCTAssertFalse(state.isPaused, "A system failure must not erase playback intent")
+        XCTAssertEqual(state.rate, 1.5)
+        XCTAssertTrue(state.beginFailureRecovery())
+        XCTAssertTrue(state.beginFailureRecovery())
+        XCTAssertFalse(state.beginFailureRecovery(), "Repeated failures must not reload indefinitely")
+        state.recordRateChange(rate: 0, reason: AVPlayer.RateDidChangeReason.setRateCalled.rawValue)
+        XCTAssertTrue(state.isPaused)
+        XCTAssertFalse(state.beginFailureRecovery(), "An explicit pause must stop recovery")
+        state.recordRateChange(rate: 1.5, reason: AVPlayer.RateDidChangeReason.setRateCalled.rawValue)
+        XCTAssertTrue(state.beginFailureRecovery(), "An explicit resume may retry again")
+        for reason in [AVPlayer.RateDidChangeReason.audioSessionInterrupted, .appBackgrounded] {
+            state.recordRateChange(rate: 0, reason: reason.rawValue)
+            XCTAssertTrue(state.isPaused, "Do not restart playback over a system interruption")
+        }
+    }
+
+    @MainActor func testFailedToEndIsHandledOnceWithoutFailedItemStatus() throws {
+        let container = CommonPlayerViewController()
+        container.loadViewIfNeeded()
+        let playerVC = try XCTUnwrap(container.children.first as? AVPlayerViewController)
+        let plugin = FailureRecoveryTestPlugin()
+        container.addPlugin(plugin: plugin)
+        let item = AVPlayerItem(asset: AVMutableComposition())
+        let player = AVPlayer(playerItem: item)
+        playerVC.player = player
+        defer { container.stopPlayback() }
+        XCTAssertNotEqual(item.status, .failed)
+        let error = NSError(domain: "CoreMediaErrorDomain", code: -19602)
+        let postFailure: (AVPlayerItem) -> Void = {
+            NotificationCenter.default.post(name: .AVPlayerItemFailedToPlayToEndTime, object: $0,
+                                            userInfo: [AVPlayerItemFailedToPlayToEndTimeErrorKey: error])
+        }
+        postFailure(item)
+        postFailure(item)
+        XCTAssertEqual(plugin.recoveryCount, 1)
+        XCTAssertEqual((plugin.error as NSError?)?.code, -19602)
+        XCTAssertEqual(plugin.failureCount, 0, "A handled recovery must not also trigger an independent retry")
+        let replacement = AVPlayerItem(asset: AVMutableComposition())
+        playerVC.player = AVPlayer(playerItem: replacement)
+        postFailure(item)
+        XCTAssertEqual(plugin.recoveryCount, 1, "Ignore stale item failures")
+        postFailure(replacement)
+        XCTAssertEqual(plugin.recoveryCount, 2)
+        container.stopPlayback()
+        postFailure(replacement)
+        XCTAssertEqual(plugin.recoveryCount, 2, "Remove failure observers on exit")
+    }
+
+    @MainActor func testLiveURLFailureAndSystemPauseRetryOnlyOnce() throws {
+        let playerVC = AVPlayerViewController()
+        let plugin = URLPlayPlugin(isLive: true)
+        plugin.playerDidLoad(playerVC: playerVC)
+        var retries = 0
+        plugin.onPlayFail = { retries += 1 }
+        let oldPlayer = AVPlayer()
+        playerVC.player = oldPlayer
+        plugin.playerDidFail(player: oldPlayer)
+        plugin.playerDidPause(player: oldPlayer)
+        XCTAssertEqual(retries, 1, "Failed-to-end followed by a system pause must not skip two live CDN candidates")
+        plugin.play(urlString: "file:///dev/null")
+        let newPlayer = try XCTUnwrap(playerVC.player)
+        plugin.playerDidPause(player: oldPlayer)
+        XCTAssertEqual(retries, 1, "Ignore callbacks from an old player")
+        plugin.playerDidFail(player: newPlayer)
+        plugin.playerDidPause(player: newPlayer)
+        XCTAssertEqual(retries, 2, "A new stream gets its own failure attempt")
+        newPlayer.replaceCurrentItem(with: nil)
+    }
+
+    @MainActor func testBufferingOverlayShowsRecoveryAndSanitizedCandidatesAboveControls() throws {
+        var details = PlaybackBufferingDetails(phase: "正在重新连接", isRecovering: true,
+                                               videoHost: "current.example", audioHost: "audio.example",
+                                               candidates: [
+                                                .init(host: "current.example", isPCDN: false, result: nil),
+                                                .init(host: "alternate.example", isPCDN: false,
+                                                      result: .init(url: "https://alternate.example/video?token=secret",
+                                                                    bytes: 262144, transferTime: 0.02, setupTime: 1,
+                                                                    error: nil, totalTime: 1.02))
+                                               ], lastError: "CoreMediaErrorDomain(-19602)")
+        XCTAssertTrue(PlaybackBufferingOverlay.shouldShow(timeControlStatus: .paused, details: details))
+        XCTAssertTrue(PlaybackBufferingOverlay.shouldShow(timeControlStatus: .waitingToPlayAtSpecifiedRate, details: nil))
+        XCTAssertFalse(PlaybackBufferingOverlay.shouldShow(timeControlStatus: .playing, details: nil))
+        XCTAssertFalse(PlaybackBufferingOverlay.shouldShow(timeControlStatus: .paused, details: nil))
+        let text = PlaybackBufferingOverlay.detailText(player: nil, details: details)
+        for expected in ["current.example", "audio.example", "alternate.example", "2.1 Mbps", "待测速", "-19602"] {
+            XCTAssertTrue(text.contains(expected), "Missing diagnostic: \(expected)")
+        }
+        XCTAssertFalse(text.contains("104.9 Mbps"), "Do not present body-only throughput as end-to-end speed")
+        XCTAssertFalse(text.contains("secret"))
+        XCTAssertFalse(text.contains("token"))
+
+        let playerVC = AVPlayerViewController()
+        let window = try XCTUnwrap(AppDelegate.shared.window)
+        let original = window.rootViewController
+        window.rootViewController = playerVC
+        playerVC.loadViewIfNeeded()
+        let overlay = PlaybackBufferingOverlay(playerVC: playerVC) { details }
+        defer { overlay.stop(); window.rootViewController = original }
+        overlay.superview?.addSubview(UIView())
+        playerVC.view.layoutIfNeeded()
+        overlay.refresh()
+        XCTAssertFalse(overlay.isHidden)
+        XCTAssertTrue(overlay.superview?.subviews.last === overlay, "Later danmaku overlays must stay behind diagnostics")
+        XCTAssertFalse(overlay.isUserInteractionEnabled, "Diagnostics must not steal remote focus")
+        let frame = overlay.convert(overlay.bounds, to: playerVC.view)
+        let guide = playerVC.unobscuredContentGuide
+        let guideOwner = try XCTUnwrap(guide.owningView)
+        let guideFrame = guideOwner.convert(guide.layoutFrame, to: playerVC.view)
+        XCTAssertLessThanOrEqual(frame.maxY, guideFrame.maxY - 23)
+        XCTAssertGreaterThan(frame.height, 0)
+        XCTAssertGreaterThanOrEqual(frame.minY, 0)
+        XCTAssertFalse(overlay.hasAmbiguousLayout)
+        let image = UIGraphicsImageRenderer(bounds: playerVC.view.bounds).image { _ in
+            playerVC.view.drawHierarchy(in: playerVC.view.bounds, afterScreenUpdates: true)
+        }
+        let attachment = XCTAttachment(image: image)
+        attachment.name = "Buffering diagnostics above native controls"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        details.isRecovering = false
+        overlay.refresh()
+        XCTAssertTrue(overlay.isHidden, "Hide after recovery or explicit pause")
+    }
+
     func testDefaultNavigationAndQualityPolicy() {
         XCTAssertEqual(TabBarPage.defaultTabBarPages, [.feed, .search, .personal])
         XCTAssertEqual(MediaQualityEnum.quality_1080p.qn, 80)
@@ -195,6 +341,7 @@ final class BiliLivingTests: XCTestCase {
         window.rootViewController = container
         container.loadViewIfNeeded()
         let plugin = BVideoPlayPlugin(playInfo: PlayInfo(aid: video.aid, cid: video.cid), detailData: detail, reportWatchHistory: false)
+        plugin.onLoadFailure = { XCTFail("Playback recovery failed: \($0)") }
         container.addPlugin(plugin: plugin)
         let playerVC = try XCTUnwrap(container.children.first as? AVPlayerViewController)
         defer { container.stopPlayback(); window.rootViewController = original }
@@ -215,10 +362,12 @@ final class BiliLivingTests: XCTestCase {
             print("Verified forward buffer: \(VideoBufferingController.bufferedSeconds(in: item.loadedTimeRanges.map(\.timeRangeValue), at: player.currentTime().seconds))s")
         }
         player.pause()
+        container.autoPlayWhenReady = false
         let position = player.currentTime().seconds
         let stream = try XCTUnwrap(info.dash.video.enumerated().first { $0.element.codecs.hasPrefix("avc") })
         let switched = await plugin.switchQuality(to: stream.element.id, streamIndex: stream.offset)
         XCTAssertTrue(switched)
+        XCTAssertFalse(container.autoPlayWhenReady, "A quality switch must not overwrite casting pause policy")
         try await Task.sleep(nanoseconds: 1_000_000_000)
         let nextPlayer = try XCTUnwrap(playerVC.player)
         XCTAssertEqual(nextPlayer.rate, 0, "Changing quality must preserve pause")
@@ -235,9 +384,47 @@ final class BiliLivingTests: XCTestCase {
         let followAction = try XCTUnwrap(infoTabs.addMenuItems(current: &current).first as? UIAction)
         XCTAssertEqual(followAction.identifier.rawValue, "follow-uploader")
         XCTAssertFalse(followAction.title.isEmpty)
+        container.autoPlayWhenReady = true
         nextPlayer.play()
-        try await Task.sleep(nanoseconds: 2_000_000_000)
-        XCTAssertGreaterThan(nextPlayer.currentTime().seconds, position)
+        try await eventually(timeout: 30) {
+            playerVC.player?.timeControlStatus == .playing
+                && (playerVC.player?.currentTime().seconds ?? 0) > position + 0.2
+        }
+
+        let resumedPlayer = try XCTUnwrap(playerVC.player)
+        resumedPlayer.playImmediately(atRate: 1.5)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        let failurePosition = resumedPlayer.currentTime().seconds
+        let beforeDelegate = try XCTUnwrap((resumedPlayer.currentItem?.asset as? AVURLAsset)?.resourceLoader.delegate
+            as? BilibiliVideoResourceLoaderDelegate)
+        let beforeStream = beforeDelegate.streamDiagnostics(for: resumedPlayer.currentItem?.accessLog()?.events.last?.uri)
+        let failedItem = try XCTUnwrap(resumedPlayer.currentItem)
+        NotificationCenter.default.post(name: .AVPlayerItemFailedToPlayToEndTime, object: failedItem,
+                                        userInfo: [AVPlayerItemFailedToPlayToEndTimeErrorKey:
+                                                    NSError(domain: "CoreMediaErrorDomain", code: -19602)])
+        XCTAssertEqual(failedItem.status, .readyToPlay, "Reproduce the failure missed by status-only observation")
+        try await eventually(timeout: 35) {
+            guard let recovered = playerVC.player, recovered !== resumedPlayer else { return false }
+            return recovered.timeControlStatus == .playing && recovered.currentTime().seconds > failurePosition + 1
+        }
+        let recovered = try XCTUnwrap(playerVC.player)
+        XCTAssertTrue(container.manuallyManagedPlayerItem === recovered.currentItem)
+        XCTAssertEqual(recovered.rate, 1.5, accuracy: 0.01)
+        XCTAssertLessThan(recovered.currentTime().seconds, failurePosition + 15, "Do not restart or skip ahead on recovery")
+        let recoveredDelegate = try XCTUnwrap((recovered.currentItem?.asset as? AVURLAsset)?.resourceLoader.delegate
+            as? BilibiliVideoResourceLoaderDelegate)
+        let recoveredStream = recoveredDelegate.streamDiagnostics(for: recovered.currentItem?.accessLog()?.events.last?.uri)
+        XCTAssertEqual(recoveredStream.bandwidth, beforeStream.bandwidth)
+        XCTAssertEqual(recoveredStream.codec, beforeStream.codec, "Recovery must preserve an explicitly selected stream")
+
+        NotificationCenter.default.post(name: .AVPlayerItemFailedToPlayToEndTime, object: recovered.currentItem,
+                                        userInfo: [AVPlayerItemFailedToPlayToEndTimeErrorKey:
+                                                    NSError(domain: "CoreMediaErrorDomain", code: -19602)])
+        recovered.pause()
+        try await eventually { plugin.bufferingDetails?.isRecovering == false }
+        try await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertTrue(playerVC.player === recovered, "A pause during probing must cancel the pending replacement")
+        XCTAssertEqual(recovered.rate, 0, "A late recovery must never override an explicit pause")
     }
 
     @MainActor func testGuestLaunchAndAccountActionPrompt() async throws {
@@ -754,6 +941,20 @@ final class BiliLivingTests: XCTestCase {
         throw NSError(domain: "CastingTest", code: 1)
     }
 
+}
+
+private final class FailureRecoveryTestPlugin: NSObject, CommonPlayerPlugin {
+    var recoveryCount = 0
+    var failureCount = 0
+    var error: Error?
+
+    func recoverPlayback(player: AVPlayer, error: Error?) -> Bool {
+        recoveryCount += 1
+        self.error = error
+        return true
+    }
+
+    func playerDidFail(player: AVPlayer) { failureCount += 1 }
 }
 
 /// A phone-side NVA client over real TCP/UDP sockets, independent of the receiver's frame decoder.

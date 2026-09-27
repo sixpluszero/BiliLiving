@@ -21,7 +21,6 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     private let isMuted: Bool
     private let mediaWarmupManager: PlayerMediaWarmupManager?
     private var currentQualityId: Int?
-    private var currentPlaybackTime: Double = 0
     private var hasAppliedStartPosition = false
     // 记录最近一次实际用于加载的 maxQuality/streamIndex，host 切换时原样复用，
     // 不去动用户当前的画质模式（自动多档 fallback 还是手动锁定某一档）
@@ -33,11 +32,20 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     private var lastDroppedFrames = 0
     private var cdnProbeReport = ""
     private var isProbingCDN = false
+    private var cdnProbeTask: Task<Void, Never>?
+    private var cdnResults = [String: CDNDiagnostics.ProbeResult]()
+    private var recoveryTask: Task<Void, Never>?
+    private var recoveryToken: UUID?
+    private var recoveryPhase: String?
+    private var recoveryState = PlaybackRecoveryState()
+    private var rateChangeObserver: NSObjectProtocol?
+    private weak var failedPlaybackItem: AVPlayerItem?
+    private var lastPlaybackError: String?
+    private var isPreparingMedia = false
 
     // 运行时 CDN 健康检测：只在真实卡顿时换 host，不用 observed/indicated 比特率比
     // （indicated 常是峰值 BANDWIDTH，播放流畅时 observed 低于它完全正常）
     private var stallUnhealthyStreak = 0
-    private var isEvaluatingHostSwitch = false
     private var lastHostSwitchAt: Date?
     /// 连续几次处于卡顿/等待缓冲才触发，避免单次抖动
     private let stallTriggerCount = 2
@@ -65,12 +73,43 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
 
     deinit {
         networkLogTimer?.invalidate()
+        cdnProbeTask?.cancel()
+        recoveryTask?.cancel()
+        if let rateChangeObserver { NotificationCenter.default.removeObserver(rateChangeObserver) }
+    }
+
+    private var currentStream: BilibiliVideoResourceLoaderDelegate.StreamDiagnostics? {
+        if let playerDelegate {
+            return playerDelegate.streamDiagnostics(for: playerVC?.player?.currentItem?.accessLog()?.events.last?.uri)
+        }
+        guard let video = PlayerMediaPreferences.current.selectVideos(
+            from: playData.videoPlayURLInfo.dash.video, maxQuality: lastMaxQuality, streamIndex: lastStreamIndex
+        ).first else { return nil }
+        return .init(host: nil, candidates: BilibiliVideoResourceLoaderDelegate.uniqueHostURLs(video.playableURLs),
+                     bandwidth: video.bandwidth, codec: video.codecs)
+    }
+
+    var bufferingDetails: PlaybackBufferingDetails? {
+        let stream = currentStream
+        let candidates = stream?.candidates ?? []
+        return PlaybackBufferingDetails(
+            phase: recoveryPhase ?? (isPreparingMedia ? "正在准备播放资源" : nil),
+            isPreparing: (isPreparingMedia || playerVC?.player?.currentItem?.status == .unknown) && !recoveryState.isPaused,
+            isRecovering: recoveryTask != nil && !recoveryState.isPaused,
+            videoHost: stream?.host,
+            audioHost: playerDelegate?.currentAudioHost,
+            candidates: candidates.compactMap { url in
+                guard let host = URLComponents(string: url)?.host else { return nil }
+                return .init(host: host, isPCDN: BVideoUrlUtils.isPCDN(url), result: cdnResults[url])
+            },
+            lastError: lastPlaybackError
+        )
     }
 
     /// 供 DebugPlugin 浮层显示的网络诊断信息
     var networkDebugInfo: String {
         var lines = [String]()
-        if let host = playerDelegate?.currentSegmentHost {
+        if let host = currentStream?.host {
             lines.append("segment host: \(host)")
         }
         if let item = playerVC?.player?.currentItem {
@@ -105,6 +144,24 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         guard let item = player.currentItem else { return }
         bufferingController = VideoBufferingController(
             item: item, target: minimizeStalling ? Double(Settings.videoBufferDuration.rawValue) : 15)
+        lastStalls = 0
+        lastDroppedFrames = 0
+        stallUnhealthyStreak = 0
+        if let rateChangeObserver { NotificationCenter.default.removeObserver(rateChangeObserver) }
+        rateChangeObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayer.rateDidChangeNotification, object: player, queue: .main
+        ) { [weak self, weak player] note in
+            guard let self, let player, self.playerVC?.player === player else { return }
+            let reason = note.userInfo?[AVPlayer.rateDidChangeReasonKey] as? String
+            self.recoveryState.recordRateChange(rate: player.rate, reason: reason)
+            Logger.info("[playback-intent] rate=\(player.rate) reason=\(reason ?? "unknown") pausedByCommand=\(self.recoveryState.isPaused)")
+            if self.recoveryState.isPaused {
+                self.cancelRecovery()
+            } else if player.rate > 0, self.failedPlaybackItem === player.currentItem, self.recoveryTask == nil {
+                _ = self.recoverPlayback(player: player, error: player.currentItem?.error)
+            }
+        }
+        startNetworkLogging()
     }
 
     func playerWillSeek(player: AVPlayer) {
@@ -115,14 +172,18 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         bufferingController?.stop()
         bufferingController = nil
         stopNetworkLogging()
+        if let rateChangeObserver { NotificationCenter.default.removeObserver(rateChangeObserver) }
+        rateChangeObserver = nil
         player.pause()
         player.replaceCurrentItem(with: nil)
     }
 
     func addMenuItems(current: inout [UIMenuElement]) -> [UIMenuElement] {
         // 挂进「播放设置」，与 Debug 并列（依赖 SpeedChangerPlugin 先创建 setting 菜单）
-        let action = UIAction(title: isProbingCDN ? "CDN 测速中…" : "CDN 测速",
-                              image: UIImage(systemName: "speedometer"))
+        let busy = isProbingCDN || recoveryTask != nil
+        let action = UIAction(title: busy ? "CDN 测速/恢复中…" : "CDN 测速",
+                              image: UIImage(systemName: "speedometer"),
+                              attributes: busy ? .disabled : [])
         { [weak self] _ in
             self?.probeCDN()
         }
@@ -145,19 +206,28 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     }
 
     private func probeCDN() {
-        guard !isProbingCDN else { return }
-        let candidates = playerDelegate?.cdnCandidates ?? []
+        guard !isProbingCDN, recoveryTask == nil else { return }
+        let candidates = currentStream?.candidates ?? []
         guard !candidates.isEmpty else {
             cdnProbeReport = "无候选 CDN"
             return
         }
-        let currentHost = playerDelegate?.currentSegmentHost
+        let currentHost = currentStream?.host
+        let generation = loadGeneration
         isProbingCDN = true
         cdnProbeReport = "CDN 测速中…"
-        Task { @MainActor [weak self] in
-            let report = await CDNDiagnostics.run(urls: candidates, currentHost: currentHost)
-            self?.cdnProbeReport = report
-            self?.isProbingCDN = false
+        (playerVC?.parent as? CommonPlayerViewController)?.updateMenus()
+        cdnProbeTask = Task { @MainActor [weak self] in
+            let results = await CDNDiagnostics.probeAll(urls: candidates) { [weak self] result in
+                guard let self, self.loadGeneration == generation, !Task.isCancelled else { return }
+                self.cdnResults[result.url] = result
+            }
+            guard let self, self.loadGeneration == generation, !Task.isCancelled else { return }
+            self.cdnProbeReport = CDNDiagnostics.report(results, currentHost: currentHost)
+            Logger.info("\(self.cdnProbeReport)")
+            self.isProbingCDN = false
+            self.cdnProbeTask = nil
+            (self.playerVC?.parent as? CommonPlayerViewController)?.updateMenus()
         }
     }
 
@@ -174,36 +244,33 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     }
 
     private func logNetworkStatus() {
-        guard let player = playerVC?.player,
-              let item = player.currentItem,
-              let event = item.accessLog()?.events.last
-        else { return }
+        guard let player = playerVC?.player, let item = player.currentItem else { return }
+        let event = item.accessLog()?.events.last
         // event.uri 是内部 variant playlist 的地址（我们用的是自定义 atv://dash/N scheme），
         // 解析出来的 host 恒为 "dash"，跟实际连的 CDN 无关；真实 host 记录在 playerDelegate 里。
-        let host = playerDelegate?.currentSegmentHost ?? "-"
-        let observedBps = event.observedBitrate
-        let indicatedBps = event.indicatedBitrate
+        let host = currentStream?.host ?? "-"
+        let observedBps = event?.observedBitrate ?? 0
+        let indicatedBps = event?.indicatedBitrate ?? 0
         let effectiveIndicated = effectiveIndicatedBitrate(from: indicatedBps)
         let observed = String(format: "%.1f", observedBps / 1_000_000)
         let indicated = String(format: "%.1f", indicatedBps / 1_000_000)
         let effective = String(format: "%.1f", effectiveIndicated / 1_000_000)
-        let stalls = event.numberOfStalls
-        let dropped = event.numberOfDroppedVideoFrames
+        let stalls = event?.numberOfStalls ?? 0
+        let dropped = event?.numberOfDroppedVideoFrames ?? 0
         let tcs = player.timeControlStatus
         let waiting = player.reasonForWaitingToPlay?.rawValue ?? "-"
         let keepUp = item.isPlaybackLikelyToKeepUp
         let buffered = bufferedSeconds(of: item)
-        let stallDelta = stalls - lastStalls
-        Logger.info("playback host \(host) observed \(observed)Mbps indicated \(indicated)Mbps effective \(effective)Mbps stalls \(stalls)(+\(stallDelta)) dropped \(dropped)(+\(dropped - lastDroppedFrames)) serverChanges \(event.numberOfServerAddressChanges) tcs \(tcs.rawValue) wait \(waiting) keepUp \(keepUp) buffered \(String(format: "%.1f", buffered))s")
+        let stallDelta = max(0, stalls - lastStalls)
+        Logger.info("playback host \(host) observed \(observed)Mbps indicated \(indicated)Mbps effective \(effective)Mbps stalls \(stalls)(+\(stallDelta)) dropped \(dropped)(+\(dropped - lastDroppedFrames)) serverChanges \(event?.numberOfServerAddressChanges ?? 0) tcs \(tcs.rawValue) wait \(waiting) keepUp \(keepUp) buffered \(String(format: "%.1f", buffered))s")
         lastStalls = stalls
         lastDroppedFrames = dropped
 
-        checkStallHealth(stallDelta: stallDelta, buffered: buffered, currentHost: host)
+        checkStallHealth(stallDelta: stallDelta, buffered: buffered)
     }
 
-    /// 用户明确暂停（.paused）。卡缓冲/断网时是 .waitingToPlayAtSpecifiedRate，仍应做健康检测。
     private var isUserPaused: Bool {
-        playerVC?.player?.timeControlStatus == .paused
+        recoveryState.isPaused
     }
 
     private var isWaitingToPlay: Bool {
@@ -213,7 +280,7 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     /// access log 的 indicated 在起播/loading 时常为 0 或负值；日志里的 effective 用流声明平均带宽兜底。
     private func effectiveIndicatedBitrate(from accessLogIndicated: Double) -> Double {
         if accessLogIndicated > 0 { return accessLogIndicated }
-        guard let declared = playerDelegate?.primaryVideoBandwidth, declared > 0 else { return 0 }
+        guard let declared = currentStream?.bandwidth, declared > 0 else { return 0 }
         return Double(declared)
     }
 
@@ -224,8 +291,8 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
 
     /// 只根据真实卡顿触发换源：正在 waiting，或本周期新增了 stall。
     /// 播放流畅时仅 observed < indicated 不触发——indicated 常是峰值，低一些完全正常。
-    private func checkStallHealth(stallDelta: Int, buffered: Double, currentHost: String) {
-        guard !isUserPaused, !isEvaluatingHostSwitch else {
+    private func checkStallHealth(stallDelta: Int, buffered: Double) {
+        guard !isUserPaused, recoveryTask == nil, !isPreparingMedia else {
             stallUnhealthyStreak = 0
             return
         }
@@ -243,107 +310,119 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         guard stallUnhealthyStreak >= stallTriggerCount else { return }
         stallUnhealthyStreak = 0
 
-        let requiredMbps = Double(playerDelegate?.primaryVideoBandwidth ?? 0) / 1_000_000
         Logger.info("[cdn] 检测到卡顿 (waiting=\(isWaitingToPlay), stallDelta=\(stallDelta), buffered \(String(format: "%.1f", buffered))s)，重新测速")
-        Task { @MainActor [weak self] in
-            await self?.evaluateHostSwitch(currentHost: currentHost, requiredMbps: requiredMbps)
-        }
-    }
-
-    @MainActor
-    private func evaluateHostSwitch(currentHost: String, requiredMbps: Double) async {
-        guard !isEvaluatingHostSwitch else { return }
-        guard !isUserPaused else { return }
-        let candidates = playerDelegate?.cdnCandidates ?? []
-        guard candidates.count > 1 else { return }
-        isEvaluatingHostSwitch = true
-        defer { isEvaluatingHostSwitch = false }
-
-        Logger.info("[cdn] \(currentHost) 因卡顿重新测速 \(candidates.count) 个候选")
-        let results = await CDNDiagnostics.probeAll(urls: candidates)
-        // 测速是异步的，期间用户可能已手动暂停；换源会重建 AVPlayer，必须取消
-        guard !isUserPaused else {
-            Logger.info("[cdn] 用户已暂停，取消 host 切换")
-            return
-        }
-        let ranked = results.filter { $0.mbps != nil }.sorted { ($0.mbps ?? -1) > ($1.mbps ?? -1) }
-        guard !ranked.isEmpty else {
-            Logger.info("[cdn] 候选测速全部失败，保持 \(currentHost)")
-            return
-        }
-
-        // 优先更快的非当前节点；若短测速仍显示当前最快，则取第二名做强制尝试
-        let alternate = ranked.first(where: { $0.host != currentHost })
-        guard let target = alternate, let targetMbps = target.mbps else {
-            Logger.info("[cdn] 没有其他可用候选，保持 \(currentHost)")
-            return
-        }
-        if requiredMbps > 0, targetMbps < requiredMbps * 0.5 {
-            Logger.info("[cdn] 备选 \(target.host) (\(String(format: "%.1f", targetMbps))Mbps) 远低于流码率，放弃切换")
-            return
-        }
-
-        let currentMbps = ranked.first(where: { $0.host == currentHost })?.mbps
-        let reason: String
-        if let currentMbps, targetMbps > currentMbps * 1.3 {
-            reason = "测速明显更快"
-        } else if let currentMbps, targetMbps >= currentMbps * 0.7 {
-            // 短测速乐观且接近时，当前节点已真实卡顿，强制换一个试试
-            reason = "测速接近但已卡顿，强制尝试"
-        } else if currentMbps == nil {
-            reason = "当前节点测速失败"
-        } else {
-            Logger.info("[cdn] 备选 \(target.host) (\(String(format: "%.1f", targetMbps))Mbps) 明显慢于当前 \(currentHost) (\(String(format: "%.1f", currentMbps!))Mbps)，保持")
-            return
-        }
-
-        lastHostSwitchAt = Date()
-        Logger.info("[cdn] 切换 host: \(currentHost) -> \(target.host) (实测\(String(format: "%.1f", targetMbps))Mbps, \(reason))")
-        await switchHost(to: target.host)
-    }
-
-    @MainActor
-    private func switchHost(to host: String) async {
         guard let player = playerVC?.player else { return }
-        // 必须在换源前记下播放意图：新 AVPlayer 默认就是 .paused，换源后再读 isUserPaused 会误判成用户暂停
-        let shouldResume = !isUserPaused
-        guard shouldResume else {
-            Logger.info("[cdn] 用户已暂停，取消 host 切换")
-            return
-        }
-        let currentTime = player.currentTime().seconds
-        guard currentTime > 0 else { return }
-        currentPlaybackTime = currentTime
+        scheduleRecovery(player: player, terminalFailure: false)
+    }
 
-        // 关掉 readyToPlay 自动 play，改由下面按 shouldResume 显式 play；异步恢复默认，避开尚未送达的 status KVO
-        let commonVC = playerVC?.parent as? CommonPlayerViewController
-        commonVC?.autoPlayWhenReady = false
-        defer {
-            DispatchQueue.main.async {
-                commonVC?.autoPlayWhenReady = true
-            }
+    func recoverPlayback(player: AVPlayer, error: Error?) -> Bool {
+        guard playerVC?.player === player else { return false }
+        failedPlaybackItem = player.currentItem
+        if let error { lastPlaybackError = PlaybackDiagnostics.error(error) }
+        cancelRecovery()
+        guard !recoveryState.isPaused else { return true }
+        guard recoveryState.failureAttempts < 2 else {
+            Logger.warn("[playback-recovery] retry limit reached: \(lastPlaybackError ?? "unknown")")
+            guard let onLoadFailure else { return false }
+            onLoadFailure("播放中断，自动重连两次后仍无法恢复。请返回重试或切换清晰度。")
+            return true
         }
+        scheduleRecovery(player: player, terminalFailure: true)
+        return true
+    }
 
-        do {
-            let generation = beginLoadGeneration()
-            try await playmedia(urlInfo: playData.videoPlayURLInfo,
-                                playerInfo: playData.playerInfo,
-                                generation: generation,
-                                maxQuality: lastMaxQuality,
-                                streamIndex: lastStreamIndex,
-                                preferredHost: host,
-                                isQualitySwitch: true)
-            if let newPlayer = playerVC?.player {
-                await newPlayer.seek(to: CMTime(seconds: currentPlaybackTime, preferredTimescale: 1), toleranceBefore: .zero, toleranceAfter: .zero)
-                if shouldResume {
-                    newPlayer.play()
-                } else {
-                    newPlayer.pause()
+    private func cancelRecovery() {
+        let wasRecovering = recoveryTask != nil
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        recoveryToken = nil
+        recoveryPhase = nil
+        if wasRecovering { (playerVC?.parent as? CommonPlayerViewController)?.updateMenus() }
+    }
+
+    private func scheduleRecovery(player: AVPlayer, terminalFailure: Bool) {
+        guard recoveryTask == nil, !isUserPaused else { return }
+        let sourceItem = player.currentItem
+        let sourceGeneration = loadGeneration
+        let stream = currentStream
+        let currentHost = stream?.host
+        // Probe alternatives first, not the server whose real segment request
+        // has already failed. This also avoids competing diagnostic downloads.
+        let candidates = (stream?.candidates ?? []).filter { URLComponents(string: $0)?.host != currentHost }
+        cdnProbeTask?.cancel()
+        cdnProbeTask = nil
+        isProbingCDN = false
+        let token = UUID()
+        recoveryToken = token
+        recoveryPhase = terminalFailure ? "播放中断，正在检测备用线路" : "卡顿，正在检测备用线路"
+        recoveryTask = Task { @MainActor [weak self, weak player] in
+            guard let self, let player else { return }
+            defer {
+                if self.recoveryToken == token {
+                    self.recoveryTask = nil
+                    self.recoveryToken = nil
+                    self.recoveryPhase = nil
+                    (self.playerVC?.parent as? CommonPlayerViewController)?.updateMenus()
                 }
             }
-        } catch {
-            Logger.warn("[cdn] 切换 host 失败: \(error)")
+            let results = await CDNDiagnostics.probeAll(urls: candidates) { [weak self] result in
+                guard let self, self.recoveryToken == token, !Task.isCancelled else { return }
+                self.cdnResults[result.url] = result
+            }
+            guard !Task.isCancelled, self.recoveryToken == token,
+                  self.loadGeneration == sourceGeneration, self.playerVC?.player === player,
+                  player.currentItem === sourceItem, !self.isUserPaused else { return }
+            // Do not discard newly downloaded buffer after playback has recovered.
+            guard terminalFailure || player.timeControlStatus == .waitingToPlayAtSpecifiedRate else { return }
+            self.cdnProbeReport = CDNDiagnostics.report(results, currentHost: currentHost)
+            let target = CDNDiagnostics.recoveryCandidate(from: results, currentHost: currentHost)
+            guard terminalFailure || target != nil else {
+                Logger.warn("[playback-recovery] no reachable alternate CDN; waiting on current connection")
+                return
+            }
+            let host = target?.host ?? currentHost
+            if terminalFailure, !self.recoveryState.beginFailureRecovery() { return }
+            self.recoveryPhase = "正在重新连接 \(host ?? "视频服务器")"
+            Logger.info("[playback-recovery] reload host \(currentHost ?? "-") -> \(host ?? "-") terminal=\(terminalFailure) codec=\(stream?.codec ?? "-")")
+            do {
+                try await self.reloadForRecovery(host: host, player: player)
+                self.lastHostSwitchAt = Date()
+            } catch is CancellationError {
+                return
+            } catch {
+                let message = PlaybackDiagnostics.error(error)
+                self.lastPlaybackError = message
+                Logger.warn("[playback-recovery] reload failed: \(message)")
+                if terminalFailure {
+                    self.onLoadFailure?("视频重连失败，请返回重试。\n\(message)")
+                }
+            }
         }
+        (playerVC?.parent as? CommonPlayerViewController)?.updateMenus()
+    }
+
+    @MainActor
+    private func reloadForRecovery(host: String?, player: AVPlayer) async throws {
+        let position = player.currentTime().seconds
+        let time = position.isFinite && position >= 0 ? position : 0
+        let rate = player.rate > 0 ? player.rate : recoveryState.rate
+        let generation = beginLoadGeneration(cancelRecovery: false)
+        try await playmedia(urlInfo: playData.videoPlayURLInfo,
+                            playerInfo: playData.playerInfo,
+                            generation: generation,
+                            maxQuality: lastMaxQuality,
+                            streamIndex: lastStreamIndex,
+                            preferredHost: host,
+                            isQualitySwitch: true,
+                            recoverySource: player)
+        let vc = try ensureActiveLoad(generation)
+        guard let newPlayer = vc.player else { throw "重连后播放器不可用" }
+        let sought = await newPlayer.seek(to: CMTime(seconds: time, preferredTimescale: 600),
+                                         toleranceBefore: .zero, toleranceAfter: .zero)
+        _ = try ensureActiveLoad(generation)
+        guard vc.player === newPlayer else { throw CancellationError() }
+        guard sought else { throw "重连后无法恢复播放位置" }
+        if !recoveryState.isPaused { newPlayer.playImmediately(atRate: rate) }
     }
 
     func playerDidDismiss(playerVC: AVPlayerViewController) {
@@ -386,7 +465,11 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         }
     }
 
-    private func beginLoadGeneration() -> Int {
+    private func beginLoadGeneration(cancelRecovery: Bool = true) -> Int {
+        if cancelRecovery { self.cancelRecovery() }
+        cdnProbeTask?.cancel()
+        cdnProbeTask = nil
+        isProbingCDN = false
         loadTask?.cancel()
         loadTask = nil
         loadGeneration += 1
@@ -394,6 +477,11 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     }
 
     private func invalidatePendingLoad(tearingDown: Bool) {
+        cancelRecovery()
+        cdnProbeTask?.cancel()
+        cdnProbeTask = nil
+        isProbingCDN = false
+        isPreparingMedia = false
         loadTask?.cancel()
         loadTask = nil
         loadGeneration += 1
@@ -420,9 +508,14 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
                            maxQuality: Int? = nil,
                            streamIndex: Int? = nil,
                            preferredHost: String? = nil,
-                           isQualitySwitch: Bool = false) async throws
+                           isQualitySwitch: Bool = false,
+                           recoverySource: AVPlayer? = nil) async throws
     {
         _ = try ensureActiveLoad(generation)
+        isPreparingMedia = true
+        defer {
+            if loadGeneration == generation { isPreparingMedia = false }
+        }
         let prepared = try await preparedMedia(urlInfo: urlInfo,
                                                playerInfo: playerInfo,
                                                maxQuality: maxQuality,
@@ -432,16 +525,26 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         // The await above may finish after a newer load generation. Validate
         // before retaining its resource-loader delegate or touching the player.
         let playerVC = try ensureActiveLoad(generation)
+        if let recoverySource {
+            guard playerVC.player === recoverySource, !isUserPaused,
+                  failedPlaybackItem === recoverySource.currentItem
+                    || recoverySource.timeControlStatus == .waitingToPlayAtSpecifiedRate else {
+                throw CancellationError()
+            }
+        }
         let delegate = prepared.delegate
         let asset = prepared.asset
         playerDelegate = delegate
+        lastMaxQuality = maxQuality
+        lastStreamIndex = streamIndex
+        delegate.startupProbeResults.forEach { cdnResults[$0.url] = $0 }
 
         // AVKit 不允许在同一场全屏播放里反复切换该属性，因此只在首次装配资源时计算一次。
         if !isQualitySwitch {
             playerVC.appliesPreferredDisplayCriteriaAutomatically = shouldApplyContentMatch(delegate: delegate)
         }
 
-        await prepare(toPlay: asset, generation: generation)
+        await prepare(toPlay: asset, generation: generation, managePlaybackManually: isQualitySwitch)
     }
 
     private func preparedMedia(urlInfo: VideoPlayURLInfo,
@@ -459,11 +562,6 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         {
             return try await mediaWarmupManager.preparedMedia(for: playInfo)
         }
-        lastStalls = 0
-        lastDroppedFrames = 0
-        lastMaxQuality = maxQuality
-        lastStreamIndex = streamIndex
-
         return try await PlayerMediaFactory.prepare(aid: playData.aid,
                                                     urlInfo: urlInfo,
                                                     playerInfo: playerInfo,
@@ -479,15 +577,8 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         let currentTime = player.currentTime().seconds
         guard currentTime.isFinite && currentTime >= 0 else { return false }
 
-        let shouldResume = !isUserPaused
-        let previousRate = player.rate
-        let commonVC = playerVC?.parent as? CommonPlayerViewController
-        commonVC?.autoPlayWhenReady = false
-        defer { commonVC?.autoPlayWhenReady = true }
-        // 保存当前播放位置
-        currentPlaybackTime = currentTime
-        currentQualityId = qualityId
-
+        let shouldResume = !isUserPaused && (player.timeControlStatus != .paused || failedPlaybackItem === player.currentItem)
+        let previousRate = player.rate > 0 ? player.rate : recoveryState.rate
         // 重新加载视频，使用新的画质
         do {
             let generation = beginLoadGeneration()
@@ -504,9 +595,14 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
                   playerVC != nil,
                   let newPlayer = playerVC?.player
             else { return false }
-            await newPlayer.seek(to: CMTime(seconds: currentPlaybackTime, preferredTimescale: 1), toleranceBefore: .zero, toleranceAfter: .zero)
+            let sought = await newPlayer.seek(to: CMTime(seconds: currentTime, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
             guard loadGeneration == generation, !Task.isCancelled else { return false }
-            if shouldResume { newPlayer.playImmediately(atRate: previousRate > 0 ? previousRate : 1) }
+            guard sought else {
+                Logger.warn("[quality] Failed to restore playback position")
+                return false
+            }
+            currentQualityId = qualityId
+            if shouldResume && !recoveryState.isPaused { newPlayer.playImmediately(atRate: previousRate) }
             else { newPlayer.pause() }
             return true
         } catch is CancellationError {
@@ -517,6 +613,32 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         }
     }
 
+    struct PlaybackRecoveryState {
+        private(set) var rate: Float = 1
+        private(set) var isPaused = false
+        private(set) var failureAttempts = 0
+
+        mutating func recordRateChange(rate: Float, reason: String?) {
+            if rate.isFinite, rate > 0 {
+                if isPaused, reason == AVPlayer.RateDidChangeReason.setRateCalled.rawValue {
+                    failureAttempts = 0
+                }
+                self.rate = rate
+                isPaused = false
+            } else if reason == AVPlayer.RateDidChangeReason.setRateCalled.rawValue
+                        || reason == AVPlayer.RateDidChangeReason.audioSessionInterrupted.rawValue
+                        || reason == AVPlayer.RateDidChangeReason.appBackgrounded.rawValue {
+                isPaused = true
+            }
+        }
+
+        mutating func beginFailureRecovery() -> Bool {
+            guard !isPaused, failureAttempts < 2 else { return false }
+            failureAttempts += 1
+            return true
+        }
+    }
+
     private func shouldApplyContentMatch(delegate: BilibiliVideoResourceLoaderDelegate) -> Bool {
         guard Settings.contentMatch else { return false }
         guard Settings.contentMatchOnlyInHDR else { return true }
@@ -524,13 +646,14 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     }
 
     @MainActor
-    func prepare(toPlay asset: AVURLAsset, generation: Int) async {
+    func prepare(toPlay asset: AVURLAsset, generation: Int, managePlaybackManually: Bool = false) async {
         guard loadGeneration == generation,
               !Task.isCancelled,
               let playerVC
         else { return }
         let playerItem = AVPlayerItem(asset: asset)
-        if let container = playerVC.parent as? CommonPlayerViewController, !container.autoPlayWhenReady {
+        if let container = playerVC.parent as? CommonPlayerViewController,
+           managePlaybackManually || !container.autoPlayWhenReady {
             container.manuallyManagedPlayerItem = playerItem
         }
 

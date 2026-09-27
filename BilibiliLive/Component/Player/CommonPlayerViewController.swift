@@ -15,8 +15,12 @@ class CommonPlayerViewController: UIViewController {
     private var rateObserver: NSKeyValueObservation?
     private var statusObserver: NSKeyValueObservation?
     private var playbackDiagnostics: PlayerDiagnosticRecorder?
+    private var bufferingOverlay: PlaybackBufferingOverlay?
     private var playToEndObserver: Any?
     private var playbackStalledObserver: Any?
+    private var failedToEndObserver: Any?
+    private weak var failedPlayerItem: AVPlayerItem?
+    private weak var readyPlayerItem: AVPlayerItem?
     private var isEnd = false
     private var isRestoringFromPip = false
     /// 新 AVPlayerItem ready 后是否自动 play。换 CDN host 等场景可临时关掉，由调用方按用户暂停状态决定是否续播。
@@ -39,6 +43,9 @@ class CommonPlayerViewController: UIViewController {
         playerVC.showsPlaybackControls = showsPlaybackControls
         playerVC.allowsPictureInPicturePlayback = allowsPictureInPicturePlayback
         playerVC.delegate = self
+        bufferingOverlay = PlaybackBufferingOverlay(playerVC: playerVC) { [weak self] in
+            self?.activePlugins.compactMap(\.bufferingDetails).first
+        }
 
         let playerObservation = playerVC.observe(\.player, options: [.old, .new]) { [weak self] vc, obs in
             Logger.debug("player changed: \(String(describing: obs.oldValue)) -> \(String(describing: obs.newValue))")
@@ -68,6 +75,7 @@ class CommonPlayerViewController: UIViewController {
         plugin.addViewToPlayerOverlay(container: playerVC.contentOverlayView!)
         activePlugins.append(plugin)
         plugin.playerDidLoad(playerVC: playerVC)
+        bufferingOverlay?.refresh()
         if playerVC.transportBarCustomMenuItems.isEmpty == false {
             updateMenus()
         }
@@ -137,6 +145,7 @@ class CommonPlayerViewController: UIViewController {
         guard shouldCleanUp else { return }
 
         cleanUpObserver()
+        bufferingOverlay?.stop()
 
         let player = playerVC.player
         player?.pause()
@@ -160,6 +169,12 @@ class CommonPlayerViewController: UIViewController {
             NotificationCenter.default.removeObserver(playbackStalledObserver)
         }
         playbackStalledObserver = nil
+        if let failedToEndObserver {
+            NotificationCenter.default.removeObserver(failedToEndObserver)
+        }
+        failedToEndObserver = nil
+        failedPlayerItem = nil
+        readyPlayerItem = nil
     }
 }
 
@@ -167,11 +182,15 @@ extension CommonPlayerViewController {
     private func playerDidChange(player: AVPlayer?) {
         playbackDiagnostics?.stop()
         playbackDiagnostics = player.map { PlayerDiagnosticRecorder(player: $0, viewController: playerVC) }
+        failedPlayerItem = nil
+        readyPlayerItem = nil
         if let player {
+            bufferingOverlay?.start()
             activePlugins.forEach { $0.playerDidChange(player: player) }
             rateObserver = player.observe(\.rate, options: [.old, .new]) {
                 [weak self] _player, obs in
                 DispatchQueue.main.async { [weak self] in
+                    guard self?.playerVC.player === player else { return }
                     self?.playerRateDidChange(player: player)
                 }
             }
@@ -181,6 +200,7 @@ extension CommonPlayerViewController {
             updateMenus()
         } else {
             cleanUpObserver()
+            bufferingOverlay?.refresh()
         }
     }
 
@@ -196,29 +216,33 @@ extension CommonPlayerViewController {
     }
 
     private func observePlayerItem(_ playerItem: AVPlayerItem) {
-        statusObserver = playerItem.observe(\.status, options: [.new, .old]) {
+        statusObserver = playerItem.observe(\.status, options: [.initial, .new]) {
             [weak self] item, _ in
-            guard let self, let player = playerVC.player else { return }
-            switch item.status {
-            case .readyToPlay:
-                isEnd = false
-                activePlugins.forEach { $0.playerWillStart(player: player) }
-                playerWillStart(player: player)
-                if autoPlayWhenReady && manuallyManagedPlayerItem !== item {
-                    player.play()
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let player = self.playerVC.player,
+                      player.currentItem === item else { return }
+                switch item.status {
+                case .readyToPlay:
+                    guard self.readyPlayerItem !== item, self.failedPlayerItem !== item else { return }
+                    self.readyPlayerItem = item
+                    self.isEnd = false
+                    self.activePlugins.forEach { $0.playerWillStart(player: player) }
+                    self.playerWillStart(player: player)
+                    if self.autoPlayWhenReady && self.manuallyManagedPlayerItem !== item {
+                        player.play()
+                    }
+                case .failed:
+                    self.handlePlaybackFailure(item: item, error: item.error)
+                default:
+                    break
                 }
-            case .failed:
-                activePlugins.forEach { $0.playerDidFail(player: player) }
-                playerDidFail(player: player)
-            default:
-                break
             }
         }
         if let playToEndObserver {
             NotificationCenter.default.removeObserver(playToEndObserver)
         }
         playToEndObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: playerItem, queue: .main) { [weak self] note in
-            guard let self, let player = playerVC.player else { return }
+            guard let self, let player = playerVC.player, player.currentItem === playerItem else { return }
             isEnd = true
             activePlugins.forEach { $0.playerDidEnd(player: player) }
             playerDidEnd(player: player)
@@ -227,10 +251,34 @@ extension CommonPlayerViewController {
             NotificationCenter.default.removeObserver(playbackStalledObserver)
         }
         playbackStalledObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemPlaybackStalled, object: playerItem, queue: .main) { [weak self] _ in
-            guard let self, let player = playerVC.player else { return }
+            guard let self, let player = playerVC.player, player.currentItem === playerItem else { return }
             activePlugins.forEach { $0.playerDidStall(player: player) }
             playerDidStall(player: player)
         }
+        if let failedToEndObserver {
+            NotificationCenter.default.removeObserver(failedToEndObserver)
+        }
+        failedToEndObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemFailedToPlayToEndTime, object: playerItem, queue: .main
+        ) { [weak self] note in
+            self?.handlePlaybackFailure(item: playerItem,
+                                       error: note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)
+        }
+    }
+
+    private func handlePlaybackFailure(item: AVPlayerItem, error: Error?) {
+        guard let player = playerVC.player, player.currentItem === item,
+              failedPlayerItem !== item else { return }
+        // Failed-to-end can leave status == readyToPlay and subsequently set rate
+        // to zero. Route the failure before that system pause hides it.
+        failedPlayerItem = item
+        Logger.warn("[playback-recovery] terminal failure: \(PlaybackDiagnostics.error(error))")
+        if activePlugins.contains(where: { $0.recoverPlayback(player: player, error: error) }) {
+            bufferingOverlay?.refresh()
+            return
+        }
+        activePlugins.forEach { $0.playerDidFail(player: player) }
+        playerDidFail(player: player)
     }
 }
 

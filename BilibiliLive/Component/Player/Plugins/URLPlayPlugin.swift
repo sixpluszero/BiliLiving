@@ -15,6 +15,7 @@ class URLPlayPlugin: NSObject {
     private let referer: String
     private let isLive: Bool
     private var currentUrl: String?
+    private var reportedFailure = false
 
     init(referer: String = "", isLive: Bool = false) {
         self.referer = referer
@@ -23,6 +24,7 @@ class URLPlayPlugin: NSObject {
 
     func play(urlString: String) {
         currentUrl = urlString
+        reportedFailure = false
         let headers: [String: String] = [
             "User-Agent": Keys.userAgent,
             "Referer": referer,
@@ -32,6 +34,12 @@ class URLPlayPlugin: NSObject {
         let player = AVPlayer(playerItem: playerItem)
         player.automaticallyWaitsToMinimizeStalling = !isLive
         playerVC?.player = player
+    }
+
+    private func reportFailure(player: AVPlayer) {
+        guard playerVC?.player === player, !reportedFailure else { return }
+        reportedFailure = true
+        onPlayFail?()
     }
 }
 
@@ -46,12 +54,12 @@ extension URLPlayPlugin: CommonPlayerPlugin {
     }
 
     func playerDidFail(player: AVPlayer) {
-        onPlayFail?()
+        reportFailure(player: player)
     }
 
     func playerDidPause(player: AVPlayer) {
         if isLive {
-            onPlayFail?()
+            reportFailure(player: player)
         }
     }
 }

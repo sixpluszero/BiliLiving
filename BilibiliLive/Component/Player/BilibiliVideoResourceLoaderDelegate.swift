@@ -57,7 +57,58 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
     /// 首选视频流的声明带宽（bps），access log 的 indicatedBitrate 尚未就绪时作健康检测兜底
     private(set) var primaryVideoBandwidth = 0
     /// 最近一次生成媒体播放列表时实际选用的分片 host
-    private(set) var currentSegmentHost: String?
+    private let diagnosticsLock = NSLock()
+    private var resolvedMediaURLs = [VideoPlayURLInfo.DashInfo.DashMediaInfo: String]()
+    private var lastVideoHost: String?
+    private var lastAudioHost: String?
+    private(set) var startupProbeResults = [CDNDiagnostics.ProbeResult]()
+    var currentSegmentHost: String? {
+        diagnosticsLock.lock()
+        defer { diagnosticsLock.unlock() }
+        return lastVideoHost
+    }
+    var currentAudioHost: String? {
+        diagnosticsLock.lock()
+        defer { diagnosticsLock.unlock() }
+        return lastAudioHost
+    }
+
+    struct StreamDiagnostics {
+        let host: String?
+        let candidates: [String]
+        let bandwidth: Int
+        let codec: String?
+    }
+
+    func streamDiagnostics(for accessLogURI: String?) -> StreamDiagnostics {
+        let url = accessLogURI.flatMap(URL.init(string:))
+        let index = url?.scheme == URLs.customScheme && url?.host == "dash"
+            ? url.flatMap { Int($0.lastPathComponent) } : nil
+        let stream: PlaybackInfo?
+        if let index, videoInfo.indices.contains(index), (videoInfo[index].info.width ?? 0) > 0 {
+            stream = videoInfo[index]
+        } else {
+            stream = videoInfo.first { ($0.info.width ?? 0) > 0 }
+        }
+        guard let stream else {
+            return StreamDiagnostics(host: currentSegmentHost, candidates: cdnCandidates,
+                                     bandwidth: primaryVideoBandwidth, codec: nil)
+        }
+        diagnosticsLock.lock()
+        let resolvedURL = resolvedMediaURLs[stream.info]
+        diagnosticsLock.unlock()
+        return StreamDiagnostics(host: resolvedURL.flatMap { URLComponents(string: $0)?.host },
+                                 candidates: Self.uniqueHostURLs(stream.info.playableURLs),
+                                 bandwidth: stream.info.bandwidth, codec: stream.info.codecs)
+    }
+
+    private func recordSelectedURL(_ url: String, for info: VideoPlayURLInfo.DashInfo.DashMediaInfo) {
+        diagnosticsLock.lock()
+        defer { diagnosticsLock.unlock() }
+        resolvedMediaURLs[info] = url
+        if (info.width ?? 0) > 0 { lastVideoHost = URLComponents(string: url)?.host }
+        else { lastAudioHost = URLComponents(string: url)?.host }
+    }
     /// 播放中途检测到当前 host 吞吐撑不住时，外部（BVideoPlayPlugin）指定的优先 host，
     /// sidx 探测会把它排到候选队首，覆盖默认 URL 顺序
     private var preferredHost: String?
@@ -159,11 +210,7 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
             return
         }
         primaryVideoBandwidth = video.bandwidth
-        var seenHosts = Set<String>()
-        cdnCandidates = video.playableURLs.filter { url in
-            guard let host = URLComponents(string: url)?.host else { return false }
-            return seenHosts.insert(host).inserted
-        }
+        cdnCandidates = Self.uniqueHostURLs(video.playableURLs)
 
         let detail = cdnCandidates
             .map { url in
@@ -172,6 +219,14 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
             }
             .joined(separator: "\n")
         Logger.info("cdn candidates for qn \(video.id) (\(video.bandwidth / 1000)kbps):\n\(detail)")
+    }
+
+    static func uniqueHostURLs(_ urls: [String]) -> [String] {
+        var seenHosts = Set<String>()
+        return urls.filter { url in
+            guard let host = URLComponents(string: url)?.host else { return false }
+            return seenHosts.insert(host).inserted
+        }
     }
 
     private func getVideoPlayList(info: PlaybackInfo) async -> String {
@@ -184,7 +239,7 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
               var offset = Int(offsetStr),
               let sidxResult = sidxResult
         else {
-            currentSegmentHost = URLComponents(string: info.url)?.host
+            recordSelectedURL(info.url, for: info.info)
             Logger.warn("[media-map] id=\(diagnosticID) aid=\(aid) qn=\(info.info.id) codec=\(info.info.codecs) sidx-unavailable; falling back to whole-file duration=\(info.duration) resource=\(PlaybackDiagnostics.resource(info.url))")
             return """
             #EXTM3U
@@ -204,9 +259,7 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         let segment = sidxResult.sidx
         let segmentURL = sidxResult.url
         Logger.info("[media-map] id=\(diagnosticID) aid=\(aid) qn=\(info.info.id) codec=\(info.info.codecs) size=\(info.info.width ?? 0)x\(info.info.height ?? 0) preferredHost=\(preferredHost ?? "-") actualResource=\(PlaybackDiagnostics.resource(segmentURL)) segments=\(segment.segments.count) maxSegmentSeconds=\(segment.maxSegmentDuration() ?? 0) bandwidth=\(info.info.bandwidth)")
-        if (info.info.width ?? 0) > 0 {
-            currentSegmentHost = URLComponents(string: segmentURL)?.host
-        }
+        recordSelectedURL(segmentURL, for: info.info)
         var playList = """
         #EXTM3U
         #EXT-X-VERSION:7
@@ -393,7 +446,9 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
 
     func selectPreferredCDNIfNeeded() async {
         guard preferredHost == nil else { return }
-        preferredHost = await CDNDiagnostics.pickFastestHost(urls: cdnCandidates)
+        startupProbeResults = await CDNDiagnostics.probeForStartup(urls: cdnCandidates)
+        preferredHost = CDNDiagnostics.ranked(startupProbeResults).first { $0.endToEndMbps != nil }?.host
+            ?? (cdnCandidates.count == 1 ? cdnCandidates.first.flatMap { URLComponents(string: $0)?.host } : nil)
         Logger.info("[cdn-selected] id=\(diagnosticID) aid=\(aid) host=\(preferredHost ?? "none") probe=first-video-256KB")
     }
 
