@@ -181,10 +181,13 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
             self.isHDR = true
         }
         var videoRange = isHDR ? "HLG" : "SDR"
-        var codecs = info.codecs
+        var codecs = PlayerMediaPreferences.hlsCodec(info)
         var supplementCodesc = ""
         // TODO: Need update all codecs with https://developer.apple.com/documentation/http_live_streaming/http_live_streaming_hls_authoring_specification_for_apple_devices/hls_authoring_specification_for_apple_devices_appendixes
-        var framerate = info.frame_rate ?? "25"
+        var framerate = PlayerMediaPreferences.hlsFrameRate(info)
+        if framerate != info.frame_rate, info.frame_rate != nil {
+            Logger.info("[media-compat] id=\(diagnosticID) model=\(PlayerMediaPreferences.hardwareModel) qn=\(info.id) sourceFPS=\(info.frame_rate ?? "-") declaredFPS=\(framerate) mediaBytesUnchanged=true")
+        }
         if isHDR10 {
             videoRange = "PQ"
         }
@@ -445,8 +448,8 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         hasUncachedFallback = false
         reset()
         for stream in info.dash.video {
-            let playable = PlayerMediaPreferences.isPlayable(stream)
-            Logger.info("[media-format] id=\(diagnosticID) aid=\(aid) qn=\(stream.id) codec=\(stream.codecs) size=\(stream.width ?? 0)x\(stream.height ?? 0) fps=\(stream.frame_rate ?? "-") bandwidth=\(stream.bandwidth) mimePlayable=\(playable)")
+            let sourceMIMEPlayable = AVURLAsset.isPlayableExtendedMIMEType("\(stream.mime_type); codecs=\"\(stream.codecs)\"")
+            Logger.info("[media-format] id=\(diagnosticID) aid=\(aid) qn=\(stream.id) codec=\(stream.codecs) declaredCodec=\(PlayerMediaPreferences.hlsCodec(stream)) size=\(stream.width ?? 0)x\(stream.height ?? 0) fps=\(stream.frame_rate ?? "-") bandwidth=\(stream.bandwidth) sourceMIMEPlayable=\(sourceMIMEPlayable) candidatePlayable=\(PlayerMediaPreferences.isPlayable(stream))")
         }
         hasSubtitle = subtitles.count > 0
         var videos = preferences.selectVideos(from: info.dash.video,

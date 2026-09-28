@@ -32,7 +32,11 @@ class BVideoQualityPlugin: NSObject, CommonPlayerPlugin {
                 }
                 return $0.element.bandwidth > $1.element.bandwidth
             }).first else { continue }
-            let title = info.support_formats.first(where: { $0.quality == id })?.new_description ?? "清晰度 \(id)"
+            var title = info.support_formats.first(where: { $0.quality == id })?.new_description ?? "清晰度 \(id)"
+            if let rate = stream.element.frame_rate,
+               PlayerMediaPreferences.hlsFrameRate(stream.element) != rate {
+                title += " · 兼容模式"
+            }
             actions.append(UIAction(title: title, state: selectedID == id ? .on : .off) { [weak self] _ in
                 self?.select(quality: id, index: stream.offset)
             })

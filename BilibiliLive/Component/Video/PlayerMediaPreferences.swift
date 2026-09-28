@@ -1,4 +1,5 @@
 import AVFoundation
+import Darwin
 import Foundation
 
 /// Capture settings once so a preloaded asset and its cache key always agree.
@@ -49,7 +50,43 @@ struct PlayerMediaPreferences: Hashable {
     }
 
     static func isPlayable(_ stream: VideoPlayURLInfo.DashInfo.DashMediaInfo) -> Bool {
-        AVURLAsset.isPlayableExtendedMIMEType("\(stream.mime_type); codecs=\"\(stream.codecs)\"")
+        AVURLAsset.isPlayableExtendedMIMEType("\(stream.mime_type); codecs=\"\(hlsCodec(stream))\"")
+    }
+
+    static func hlsCodec(_ stream: VideoPlayURLInfo.DashInfo.DashMediaInfo,
+                         supportsMIME: (String) -> Bool = AVURLAsset.isPlayableExtendedMIMEType) -> String {
+        // The first-generation Apple TV rejects the detailed High 5.2 HLS
+        // declaration, but decodes the same 4K60 samples when it reads avcC.
+        // Keep the real resolution/frame rate; never invent a lower AVC level.
+        if stream.codecs == "avc1.640034",
+           !supportsMIME("\(stream.mime_type); codecs=\"\(stream.codecs)\"") {
+            return "avc1"
+        }
+        return stream.codecs
+    }
+
+    static let hardwareModel: String = {
+        var info = utsname()
+        guard uname(&info) == 0 else {
+            Logger.warn("[media-format] unable to read hardware model")
+            return ""
+        }
+        return withUnsafeBytes(of: info.machine) { bytes in
+            String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self)
+        }
+    }()
+
+    static func hlsFrameRate(_ stream: VideoPlayURLInfo.DashInfo.DashMediaInfo,
+                             deviceModel: String = hardwareModel) -> String {
+        let original = stream.frame_rate ?? "25"
+        // On AppleTV6,2, declaring HDR10 above 30 fps fails before media is read.
+        // Local same-byte tests verify PQ/BT.2020 4K frames at ~59.94 fps with
+        // this legacy declaration. It is metadata compatibility, not transcoding.
+        if deviceModel == "AppleTV6,2", stream.id == 125,
+           let rate = frameRate(original), rate > 30 {
+            return "30"
+        }
+        return original
     }
 
     private static func frameRate(_ value: String?) -> Double? {

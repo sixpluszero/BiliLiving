@@ -55,11 +55,12 @@ See the [testing notes](docs/TESTING.md) (Chinese) for implementation and verifi
 
 ### 4K and high-bitrate playback improvements for overseas networks
 
-Upstream already supports 4K, CDN probing, and switching CDNs when playback stalls. BiliLiving adds **quality-first proactive segment caching**, targeting **5 minutes on disk** by default. Choose 30 seconds, 2 minutes, or 5 minutes; existing saved choices are preserved. Up to four downloads fetch upcoming audio and video, retrying failed fragments on alternate CDNs without rebuilding the entire player.
+Upstream already supports 4K, CDN probing, and switching CDNs when playback stalls. BiliLiving adds **quality-first proactive segment caching**, targeting **5 minutes on disk** by default. Choose 30 seconds, 2 minutes, or 5 minutes; existing saved choices are preserved. Up to eight small-block downloads fetch upcoming audio and video, retrying failed blocks on alternate CDNs without rebuilding the entire player.
 
 - Adjust the target immediately under **播放设置 → 视频预缓冲** (Playback Settings → Video Buffer). Disable **质量优先预缓存** under Settings → Audio/Video to return to native fetching.
 - Startup tries to accumulate 30 seconds of media with at most 30 seconds of additional prebuffer waiting, rather than waiting for all five minutes. AVPlayer's own forward-buffer target stays at or below 30 seconds; the larger disk reserve is capped at approximately 1 GB per playback.
 - Keep the selected resolution and frame rate, preferring HEVC at that quality. If the device rejects a codec, try compatible HEVC/HDR at the same resolution without reducing frame rate; otherwise report the incompatibility rather than silently lowering quality.
+- First-generation Apple TV hardware uses a device-verified legacy HDR10 playlist declaration, labeled compatibility mode in the quality menu. The original 4K high-frame-rate media and HDR metadata are retained without transcoding or removing frames; see the buffering strategy for its precise scope.
 
 This is temporary buffering, not offline downloading. Sustained insufficient delivery from all available CDNs can still cause stalls. See the [buffering strategy](docs/PLAYBACK-BUFFERING.md) (Chinese) for implementation and device-validation limits.
 

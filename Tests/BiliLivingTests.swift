@@ -26,6 +26,23 @@ final class BiliLivingTests: XCTestCase {
         }
     }
 
+    func testSegmentCacheRanksRealTransfersInsteadOfLastCompletingServer() {
+        let now = Date()
+        var health = VideoSegmentCache.SourceHealth()
+        XCTAssertEqual(health.select(count: 2, inFlight: [], now: now), 0)
+        XCTAssertEqual(health.select(count: 2, inFlight: [0], now: now), 1,
+                       "An unmeasured alternative gets a real media block, not a synthetic probe")
+        health.record(source: 0, bytes: 524_288, elapsed: 0.1, failedSources: [], now: now)
+        health.record(source: 1, bytes: 524_288, elapsed: 4, failedSources: [], now: now)
+        XCTAssertEqual(health.select(count: 2, inFlight: [], now: now), 0,
+                       "A late slow response must not overwrite the faster preferred source")
+        health.record(source: 1, bytes: 524_288, elapsed: 0.2, failedSources: [0], now: now)
+        XCTAssertEqual(health.select(count: 2, inFlight: [], now: now), 1,
+                       "A failed source must cool down even if its historical throughput was high")
+        var single = VideoSegmentCache.SourceHealth()
+        XCTAssertEqual(single.select(count: 1, inFlight: [0], now: now), 0)
+    }
+
     func testSegmentCachePrefetchesWithoutPlayerRequestsAndServesDiskHits() async throws {
         let origin = try SegmentCacheTestOrigin()
         let monitor = VideoSegmentCacheMonitor()
@@ -40,7 +57,7 @@ final class BiliLivingTests: XCTestCase {
         XCTAssertEqual(response.data, origin.payload.subdata(in: 8..<12))
         XCTAssertEqual(origin.requestCount, before, "The complete fragment must come from disk")
         XCTAssertGreaterThan(monitor.value.hits, 0)
-        XCTAssertLessThanOrEqual(origin.maximumActiveRequests, 4)
+        XCTAssertLessThanOrEqual(origin.maximumActiveRequests, 8)
     }
 
     func testSegmentCacheRejectsTruncatedCDNAndRetriesSameFragment() async throws {
@@ -521,6 +538,122 @@ final class BiliLivingTests: XCTestCase {
         XCTAssertEqual(preferences.selectVideos(from: [avc4K, fractionalHDR], isPlayable: compatible).map(\.id), [125])
     }
 
+    func testAVCHigh52DeclarationDefersToMediaWithoutInventingALowerLevel() {
+        func stream(_ codec: String) -> VideoPlayURLInfo.DashInfo.DashMediaInfo {
+            .init(id: 120, base_url: "https://example.invalid/video.m4s", backup_url: nil,
+                  bandwidth: 19_031_651, mime_type: "video/mp4", codecs: codec,
+                  width: 3840, height: 2160, frame_rate: "59.933", sar: nil, start_with_sap: nil,
+                  segment_base: .init(initialization: "0-100", index_range: "101-200"), codecid: nil)
+        }
+        let avc = stream("avc1.640034")
+        XCTAssertEqual(PlayerMediaPreferences.hlsCodec(avc, supportsMIME: { _ in false }), "avc1")
+        XCTAssertEqual(PlayerMediaPreferences.hlsCodec(avc, supportsMIME: { _ in true }), avc.codecs)
+        for codec in ["avc1.640033", "avc1.64003C", "hvc1.2.4.L153.90", "av01.0.13M.08"] {
+            XCTAssertEqual(PlayerMediaPreferences.hlsCodec(stream(codec), supportsMIME: { _ in false }), codec,
+                           "Do not generalize the verified workaround to untested formats")
+        }
+        XCTAssertEqual(avc.width, 3840)
+        XCTAssertEqual(avc.height, 2160)
+        XCTAssertEqual(avc.frame_rate, "59.933")
+        XCTAssertEqual(avc.codecs, "avc1.640034", "Original metadata must remain truthful")
+    }
+
+    func testHDRFrameRateCompatibilityIsLimitedToVerifiedHardwareAndFormat() {
+        func stream(_ quality: Int, fps: String) -> VideoPlayURLInfo.DashInfo.DashMediaInfo {
+            .init(id: quality, base_url: "https://example.invalid/video.m4s", backup_url: nil,
+                  bandwidth: 17_344_172, mime_type: "video/mp4", codecs: "hvc1.2.4.L153.90",
+                  width: 3840, height: 2160, frame_rate: fps, sar: nil, start_with_sap: nil,
+                  segment_base: .init(initialization: "0-100", index_range: "101-200"), codecid: nil)
+        }
+        let hdr = stream(125, fps: "59.933")
+        XCTAssertEqual(PlayerMediaPreferences.hlsFrameRate(hdr, deviceModel: "AppleTV6,2"), "30")
+        XCTAssertEqual(PlayerMediaPreferences.hlsFrameRate(hdr, deviceModel: "AppleTV11,1"), "59.933")
+        XCTAssertEqual(PlayerMediaPreferences.hlsFrameRate(hdr, deviceModel: "AppleTV14,1"), "59.933")
+        XCTAssertEqual(PlayerMediaPreferences.hlsFrameRate(hdr, deviceModel: ""), "59.933")
+        XCTAssertEqual(PlayerMediaPreferences.hlsFrameRate(stream(120, fps: "59.933"), deviceModel: "AppleTV6,2"), "59.933")
+        XCTAssertEqual(PlayerMediaPreferences.hlsFrameRate(stream(126, fps: "59.933"), deviceModel: "AppleTV6,2"), "59.933")
+        XCTAssertEqual(PlayerMediaPreferences.hlsFrameRate(stream(125, fps: "24"), deviceModel: "AppleTV6,2"), "24")
+        XCTAssertEqual(PlayerMediaPreferences.hlsFrameRate(stream(125, fps: "60000/1001"), deviceModel: "AppleTV6,2"), "30")
+        XCTAssertEqual(hdr.frame_rate, "59.933", "Do not mutate actual media metadata")
+    }
+
+    @MainActor func testReported4K60PlaybackUsesActualFramesAndContinuousCache() async throws {
+        try await verifyReported4KPlayback(hdr: false)
+    }
+
+    @MainActor func testReportedHDR60PlaybackPreservesPQAndActualFrameRate() async throws {
+        try await verifyReported4KPlayback(hdr: true)
+    }
+
+    @MainActor private func verifyReported4KPlayback(hdr: Bool) async throws {
+        let aid = 117332567397550
+        let cid = 42200205797
+        let info = try await WebRequest.requestPlayUrl(aid: aid, cid: cid)
+        guard let index = info.dash.video.firstIndex(where: {
+            hdr ? ($0.id == 125 && $0.isHevc) : ($0.id == 120 && $0.codecs == "avc1.640034")
+        }) else {
+            throw XCTSkip("The on-device 4K entitlement is required for this regression")
+        }
+        let previous = Settings.videoProactiveBuffering
+        let previousQuality = Settings.mediaQuality
+        Settings.videoProactiveBuffering = true
+        Settings.mediaQuality = hdr ? .bestAvailable : .quality_2160p
+        defer {
+            Settings.videoProactiveBuffering = previous
+            Settings.mediaQuality = previousQuality
+        }
+        let data = PlayerDetailData(aid: aid, cid: cid, epid: nil, seasonId: nil, subType: nil, videoPlayURLInfo: info)
+        let container = CommonPlayerViewController()
+        let window = try XCTUnwrap(AppDelegate.shared.window)
+        let original = window.rootViewController
+        window.rootViewController = container
+        container.loadViewIfNeeded()
+        let plugin = BVideoPlayPlugin(playInfo: .init(aid: aid, cid: cid), detailData: data, reportWatchHistory: false)
+        plugin.onLoadFailure = { XCTFail("The 4K source failed: \($0)") }
+        container.addPlugin(plugin: plugin)
+        defer { container.stopPlayback(); window.rootViewController = original }
+        let controller = try XCTUnwrap(container.children.first as? AVPlayerViewController)
+        try await eventually(timeout: 60) { controller.player?.timeControlStatus == .playing }
+        let player = try XCTUnwrap(controller.player)
+        let item = try XCTUnwrap(player.currentItem)
+        let delegate = try XCTUnwrap((item.asset as? AVURLAsset)?.resourceLoader.delegate as? BilibiliVideoResourceLoaderDelegate)
+        let stream = delegate.streamDiagnostics(for: item.accessLog()?.events.last?.uri)
+        XCTAssertEqual(stream.codec, info.dash.video[index].codecs)
+        XCTAssertEqual(stream.bandwidth, info.dash.video[index].bandwidth)
+        XCTAssertTrue(delegate.masterPlaylist.contains("RESOLUTION=3840x2160"))
+        XCTAssertTrue(delegate.masterPlaylist.contains("FRAME-RATE=\(PlayerMediaPreferences.hlsFrameRate(info.dash.video[index]))"))
+        if !hdr { XCTAssertFalse(delegate.masterPlaylist.contains("FRAME-RATE=30,")) }
+        XCTAssertTrue(delegate.masterPlaylist.contains("VIDEO-RANGE=\(hdr ? "PQ" : "SDR")"))
+        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: nil)
+        item.add(output)
+        defer { item.remove(output) }
+        let probe = HDRPlaybackFrameCadenceProbe(output: output)
+        probe.start()
+        defer { probe.stop() }
+        try await Task.sleep(nanoseconds: 10_000_000_000)
+        probe.stop()
+        Logger.info("[4k-regression] hdr=\(hdr) cadence=\(probe.summary)")
+        XCTAssertGreaterThan(probe.sampledVideoFPS, 50, "Verify near-60 fps decoded frame delivery, not a running audio clock")
+        XCTAssertEqual(player.timeControlStatus, .playing)
+        let time = player.currentTime()
+        var frameTime = CMTime.invalid
+        let frame = try XCTUnwrap(output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: &frameTime))
+        XCTAssertEqual(CVPixelBufferGetWidth(frame), 3840)
+        XCTAssertEqual(CVPixelBufferGetHeight(frame), 2160)
+        XCTAssertEqual(frameTime.seconds, time.seconds, accuracy: 0.1)
+        let attachments = CVBufferCopyAttachments(frame, .shouldPropagate) as? [String: Any]
+        let transfer = attachments?[kCVImageBufferTransferFunctionKey as String] as? String
+        let primaries = attachments?[kCVImageBufferColorPrimariesKey as String] as? String
+        if hdr {
+            XCTAssertEqual(transfer, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String)
+            XCTAssertEqual(primaries, kCVImageBufferColorPrimaries_ITU_R_2020 as String)
+        }
+        try await eventually(timeout: 90) { (delegate.cacheSnapshot?.bufferedSeconds ?? 0) >= 60 }
+        XCTAssertEqual(item.status, .readyToPlay)
+        XCTAssertFalse(item.errorLog()?.events.contains { [-11848, -11868, -16849].contains($0.errorStatusCode) } ?? false)
+        Logger.info("[4k-regression] hdr=\(hdr) position=\(player.currentTime().seconds) frame=\(frameTime.seconds) transfer=\(transfer ?? "-") primaries=\(primaries ?? "-") buffered=\(delegate.cacheSnapshot?.bufferedSeconds ?? 0)s storedBytes=\(delegate.cacheSnapshot?.storedBytes ?? 0)")
+    }
+
     @MainActor func testReportedVideoSDRHEVCNegotiation() async throws {
         // Public regression source that offered incompatible AVC 4K60 on the
         // first-generation TV. Run on-device to retain its existing entitlements.
@@ -542,6 +675,231 @@ final class BiliLivingTests: XCTestCase {
             }
             Logger.info("[codec-negotiation] request=\(name) has4KSDRHEVC=\(candidates.contains { $0.id == 120 && $0.isHevc && ($0.width ?? 0) >= 3840 })")
         }
+    }
+
+    @MainActor func testReportedHDRPlaybackCompatibilityMatrix() async throws {
+        let aid = 117332567397550
+        let info = try await WebRequest.requestPlayUrl(aid: aid, cid: 42200205797)
+        guard let video = info.dash.video.first(where: { $0.id == 125 && $0.isHevc }),
+              let audio = info.dash.audio?.first else {
+            throw XCTSkip("This diagnostic needs the device account's HDR stream entitlement")
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("HDRPlaybackMatrix-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try FileManager.default.removeItem(at: directory) }
+        let videoFixture = try await HDRPlaybackTestFixture.prepare(media: video, aid: aid, name: "video", directory: directory)
+        let audioFixture = try await HDRPlaybackTestFixture.prepare(media: audio, aid: aid, name: "audio", directory: directory)
+        let server = HttpServer()
+        server.listenAddressIPv4 = "127.0.0.1"
+        server["/video.mp4"] = { videoFixture.response($0) }
+        server["/audio.mp4"] = { audioFixture.response($0) }
+        server["/video.m3u8"] = { _ in .ok(.text(videoFixture.playlist), ["Content-Type": "application/vnd.apple.mpegurl"]) }
+        server["/audio.m3u8"] = { _ in .ok(.text(audioFixture.playlist), ["Content-Type": "application/vnd.apple.mpegurl"]) }
+        let fullCodecs = "\(video.codecs),\(audio.codecs)"
+        let variants: [(name: String, frameRate: String?, codecs: String?, resolution: Bool)] = [
+            ("declared-source-rate", video.frame_rate, video.codecs, true),
+            ("declared-60-with-audio-codec", "60", fullCodecs, true),
+            ("hdr-generic-codec", video.frame_rate, "hvc1,\(audio.codecs)", true),
+            ("hdr-omitted-codecs", video.frame_rate, nil, true),
+            ("omitted-optional-frame-rate", nil, fullCodecs, true),
+            ("omitted-frame-rate-video-codec-only", nil, video.codecs, true),
+            ("omitted-frame-rate-and-resolution", nil, fullCodecs, false),
+            ("declared-source-rate-without-resolution", video.frame_rate, fullCodecs, false),
+            // Diagnostic control only: this reproduces the previous manifest,
+            // not a proposal to disguise 60 fps media as a 30 fps source.
+            ("legacy-declared-30-control", "30", fullCodecs, true),
+        ]
+        for variant in variants {
+            let frameRate = variant.frameRate.map { ",FRAME-RATE=\($0)" } ?? ""
+            let codecs = variant.codecs.map { ",CODECS=\"\($0)\"" } ?? ""
+            let resolution = variant.resolution ? ",RESOLUTION=\(video.width ?? 0)x\(video.height ?? 0)" : ""
+            let master = """
+            #EXTM3U
+            #EXT-X-VERSION:7
+            #EXT-X-INDEPENDENT-SEGMENTS
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",DEFAULT=YES,AUTOSELECT=YES,NAME="audio",URI="audio.m3u8"
+            #EXT-X-STREAM-INF:AUDIO="audio"\(codecs)\(resolution)\(frameRate),BANDWIDTH=\(Int(Double(video.bandwidth + audio.bandwidth) * 1.5)),AVERAGE-BANDWIDTH=\(video.bandwidth + audio.bandwidth),VIDEO-RANGE=PQ
+            video.m3u8
+
+            """
+            server["/\(variant.name).m3u8"] = { _ in
+                Logger.info("[hdr-matrix-http] master=\(variant.name)")
+                return .ok(.text(master), ["Content-Type": "application/vnd.apple.mpegurl"])
+            }
+        }
+        try server.start(0, forceIPv4: true)
+        defer { server.stop() }
+        let port = try server.port()
+        let window = try XCTUnwrap(AppDelegate.shared.window)
+        let original = window.rootViewController
+        defer { window.rootViewController = original }
+        var outcomes = [String]()
+        for variant in variants {
+            let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/\(variant.name).m3u8"))
+            outcomes.append(try await inspectHDRPlayback(url: url, name: variant.name, window: window))
+        }
+        outcomes.append(try await inspectHDRPlayback(url: videoFixture.file, name: "direct-local-fmp4", window: window))
+        let directHTTP = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/video.mp4"))
+        outcomes.append(try await inspectHDRPlayback(url: directHTTP, name: "direct-http-fmp4", window: window))
+        let mediaPlaylist = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/video.m3u8"))
+        outcomes.append(try await inspectHDRPlayback(url: mediaPlaylist, name: "direct-media-playlist", window: window))
+        if let avc = info.dash.video.first(where: { $0.id == 120 && $0.codecs.hasPrefix("avc") }) {
+            let fixture = try await HDRPlaybackTestFixture.prepare(media: avc, aid: aid, name: "avc", directory: directory)
+            outcomes.append(try await inspectHDRPlayback(url: fixture.file, name: "direct-local-avc-control", window: window))
+        }
+        let attachment = XCTAttachment(string: outcomes.joined(separator: "\n"))
+        attachment.name = "Same-source HDR compatibility matrix"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        XCTAssertEqual(outcomes.count, variants.count + 3 + (info.dash.video.contains { $0.id == 120 && $0.codecs.hasPrefix("avc") } ? 1 : 0))
+    }
+
+    @MainActor private func inspectHDRPlayback(url: URL, name: String, window: UIWindow) async throws -> String {
+        let controller = AVPlayerViewController()
+        controller.appliesPreferredDisplayCriteriaAutomatically = true
+        controller.allowsPictureInPicturePlayback = false
+        window.rootViewController = controller
+        controller.loadViewIfNeeded()
+        let item = AVPlayerItem(url: url)
+        let player = AVPlayer(playerItem: item)
+        controller.player = player
+        var videoOutput: AVPlayerItemVideoOutput?
+        defer {
+            player.pause()
+            if let videoOutput { item.remove(videoOutput) }
+            player.replaceCurrentItem(with: nil)
+            controller.player = nil
+            window.rootViewController = UIViewController()
+        }
+        let start = ProcessInfo.processInfo.systemUptime
+        Logger.info("[hdr-matrix] name=\(name) begin hdrEligible=\(AVPlayer.eligibleForHDRPlayback) matching=\(window.avDisplayManager.isDisplayCriteriaMatchingEnabled)")
+        while item.status == .unknown, ProcessInfo.processInfo.systemUptime - start < 12 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        if item.status == .readyToPlay {
+            player.play()
+            let displayDeadline = Date().addingTimeInterval(5)
+            while !controller.isReadyForDisplay, item.status == .readyToPlay, Date() < displayDeadline {
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+            let output = AVPlayerItemVideoOutput(pixelBufferAttributes: nil)
+            item.add(output)
+            videoOutput = output
+        }
+        var frames = 0
+        var lastFramePosition = -1.0
+        var size = "none"
+        var transferFunction = "-"
+        var colorPrimaries = "-"
+        var frameGaps = 0
+        var largestFrameLag = 0.0
+        var cadence = "none"
+        if let videoOutput {
+            let probe = HDRPlaybackFrameCadenceProbe(output: videoOutput)
+            probe.start()
+            defer { probe.stop() }
+            try await Task.sleep(nanoseconds: 5_000_000_000)
+            probe.stop()
+            cadence = probe.summary
+            for _ in 0..<8 {
+                try await Task.sleep(nanoseconds: 500_000_000)
+                let time = player.currentTime()
+                var displayTime = CMTime.invalid
+                if videoOutput.hasNewPixelBuffer(forItemTime: time),
+                   let frame = videoOutput.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: &displayTime) {
+                    if displayTime.seconds > lastFramePosition { frames += 1 }
+                    lastFramePosition = displayTime.seconds
+                    largestFrameLag = max(largestFrameLag, time.seconds - displayTime.seconds)
+                    size = "\(CVPixelBufferGetWidth(frame))x\(CVPixelBufferGetHeight(frame))"
+                    let attachments = CVBufferCopyAttachments(frame, .shouldPropagate) as? [String: Any]
+                    transferFunction = attachments?[kCVImageBufferTransferFunctionKey as String] as? String ?? "-"
+                    colorPrimaries = attachments?[kCVImageBufferColorPrimariesKey as String] as? String ?? "-"
+                    Logger.info("[hdr-matrix-frame] name=\(name) position=\(time.seconds) framePosition=\(displayTime.seconds) size=\(size) transfer=\(transferFunction) primaries=\(colorPrimaries)")
+                } else {
+                    frameGaps += 1
+                }
+            }
+        }
+        let trackInfo: String
+        do {
+            if let track = try await item.asset.loadTracks(withMediaType: .video).first {
+                trackInfo = "nominalFPS=\(try await track.load(.nominalFrameRate))"
+            } else { trackInfo = "no-video-track" }
+        } catch {
+            trackInfo = "trackError=\(PlaybackDiagnostics.error(error))"
+        }
+        let result = "name=\(name) item=\(item.status.rawValue) control=\(player.timeControlStatus.rawValue) displayReady=\(controller.isReadyForDisplay) position=\(player.currentTime().seconds) freshFrames=\(frames) frameGaps=\(frameGaps) maxFrameLag=\(largestFrameLag) lastFrame=\(lastFramePosition) size=\(size) transfer=\(transferFunction) primaries=\(colorPrimaries) \(trackInfo) cadence={\(cadence)} screenMaxFPS=\(UIScreen.main.maximumFramesPerSecond) elapsed=\(ProcessInfo.processInfo.systemUptime - start)s error=\(PlaybackDiagnostics.error(item.error))"
+        Logger.info("[hdr-matrix] \(result)")
+        if let error = item.error as NSError? {
+            let failedURL = error.userInfo[NSURLErrorFailingURLStringErrorKey] as? String
+            Logger.info("[hdr-matrix-error] name=\(name) userInfoKeys=\(error.userInfo.keys.sorted().joined(separator: ",")) failedURL=\(PlaybackDiagnostics.resource(failedURL))")
+        }
+        for error in item.errorLog()?.events ?? [] {
+            Logger.warn("[hdr-matrix-error] name=\(name) code=\(error.errorStatusCode) domain=\(error.errorDomain) comment=\(PlaybackDiagnostics.sanitize(error.errorComment ?? "-"))")
+        }
+        print(result)
+        return result
+    }
+
+    @MainActor func testReportedAVCCodecDeclarationMatrix() async throws {
+        let aid = 117332567397550
+        let info = try await WebRequest.requestPlayUrl(aid: aid, cid: 42200205797)
+        guard let video = info.dash.video.first(where: { $0.id == 120 && $0.codecs.hasPrefix("avc") }),
+              let audio = info.dash.audio?.first else {
+            throw XCTSkip("This diagnostic needs the device account's 4K stream entitlement")
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AVCPlaybackMatrix-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try FileManager.default.removeItem(at: directory) }
+        let videoFixture = try await HDRPlaybackTestFixture.prepare(media: video, aid: aid, name: "video", directory: directory)
+        let audioFixture = try await HDRPlaybackTestFixture.prepare(media: audio, aid: aid, name: "audio", directory: directory)
+        let server = HttpServer()
+        server.listenAddressIPv4 = "127.0.0.1"
+        server["/video.mp4"] = { videoFixture.response($0) }
+        server["/audio.mp4"] = { audioFixture.response($0) }
+        server["/video.m3u8"] = { _ in .ok(.text(videoFixture.playlist), ["Content-Type": "application/vnd.apple.mpegurl"]) }
+        server["/audio.m3u8"] = { _ in .ok(.text(audioFixture.playlist), ["Content-Type": "application/vnd.apple.mpegurl"]) }
+        let variants: [(name: String, codecs: String?, frameRate: String?)] = [
+            ("avc-declared-codec", "\(video.codecs),\(audio.codecs)", video.frame_rate),
+            ("avc-omitted-optional-codecs", nil, video.frame_rate),
+            ("avc-generic-sample-entry", "avc1,\(audio.codecs)", video.frame_rate),
+            ("avc-omitted-codecs-and-rate", nil, nil),
+        ]
+        for variant in variants {
+            let codecs = variant.codecs.map { ",CODECS=\"\($0)\"" } ?? ""
+            let rate = variant.frameRate.map { ",FRAME-RATE=\($0)" } ?? ""
+            let master = """
+            #EXTM3U
+            #EXT-X-VERSION:7
+            #EXT-X-INDEPENDENT-SEGMENTS
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",DEFAULT=YES,AUTOSELECT=YES,NAME="audio",URI="audio.m3u8"
+            #EXT-X-STREAM-INF:AUDIO="audio"\(codecs),RESOLUTION=\(video.width ?? 0)x\(video.height ?? 0)\(rate),BANDWIDTH=\(Int(Double(video.bandwidth + audio.bandwidth) * 1.5)),VIDEO-RANGE=SDR
+            video.m3u8
+
+            """
+            server["/\(variant.name).m3u8"] = { _ in
+                Logger.info("[hdr-matrix-http] master=\(variant.name)")
+                return .ok(.text(master), ["Content-Type": "application/vnd.apple.mpegurl"])
+            }
+        }
+        try server.start(0, forceIPv4: true)
+        defer { server.stop() }
+        let port = try server.port()
+        let window = try XCTUnwrap(AppDelegate.shared.window)
+        let original = window.rootViewController
+        defer { window.rootViewController = original }
+        var outcomes = [String]()
+        for variant in variants {
+            let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/\(variant.name).m3u8"))
+            outcomes.append(try await inspectHDRPlayback(url: url, name: variant.name, window: window))
+        }
+        let mediaPlaylist = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/video.m3u8"))
+        outcomes.append(try await inspectHDRPlayback(url: mediaPlaylist, name: "avc-direct-media-playlist", window: window))
+        let attachment = XCTAttachment(string: outcomes.joined(separator: "\n"))
+        attachment.name = "Same-source AVC codec declaration matrix"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        XCTAssertEqual(outcomes.count, variants.count + 1)
     }
 
     @MainActor func testFollowUsesVerifiedStateAndPreservesStateOnFailure() async throws {
@@ -1291,6 +1649,141 @@ final class BiliLivingTests: XCTestCase {
         throw NSError(domain: "CastingTest", code: 1)
     }
 
+}
+
+@MainActor private final class HDRPlaybackFrameCadenceProbe: NSObject {
+    private let output: AVPlayerItemVideoOutput
+    private var link: CADisplayLink?
+    private var callbacks = 0
+    private var frames = 0
+    private var firstHost: CFTimeInterval?
+    private var lastHost = 0.0
+    private var firstFrame: Double?
+    private var lastFrame = -1.0
+
+    init(output: AVPlayerItemVideoOutput) {
+        self.output = output
+        super.init()
+    }
+
+    func start() {
+        let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
+        link.preferredFramesPerSecond = 60
+        link.add(to: .main, forMode: .common)
+        self.link = link
+    }
+
+    func stop() {
+        link?.invalidate()
+        link = nil
+    }
+
+    var summary: String {
+        let hostDuration = lastHost - (firstHost ?? lastHost)
+        return "callbacks=\(callbacks) fresh=\(frames) refreshHz=\(hostDuration > 0 ? Double(max(0, callbacks - 1)) / hostDuration : 0) sampledVideoFPS=\(sampledVideoFPS) lastFrame=\(lastFrame)"
+    }
+
+    var sampledVideoFPS: Double {
+        let duration = lastFrame - (firstFrame ?? lastFrame)
+        return duration > 0 ? Double(max(0, frames - 1)) / duration : 0
+    }
+
+    @objc private func tick(_ link: CADisplayLink) {
+        callbacks += 1
+        if firstHost == nil { firstHost = link.timestamp }
+        lastHost = link.timestamp
+        let time = output.itemTime(forHostTime: link.timestamp)
+        var displayTime = CMTime.invalid
+        if output.hasNewPixelBuffer(forItemTime: time),
+           output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: &displayTime) != nil,
+           displayTime.seconds > lastFrame {
+            frames += 1
+            if firstFrame == nil { firstFrame = displayTime.seconds }
+            lastFrame = displayTime.seconds
+        }
+    }
+}
+
+private struct HDRPlaybackTestFixture: Sendable {
+    let file: URL
+    let playlist: String
+    let payload: Data
+    let mimeType: String
+
+    static func prepare(media: VideoPlayURLInfo.DashInfo.DashMediaInfo, aid: Int,
+                        name: String, directory: URL) async throws -> HDRPlaybackTestFixture {
+        let downloader = SidxDownloader()
+        let downloadedIndex = await downloader.sidx(from: media)
+        let result = try XCTUnwrap(downloadedIndex)
+        let indexEnd = try XCTUnwrap(media.segment_base.index_range.split(separator: "-").last.flatMap { Int($0) })
+        let initialization = media.segment_base.initialization.split(separator: "-").compactMap { Int($0) }
+        XCTAssertEqual(initialization.count, 2)
+        guard initialization.count == 2, result.sidx.timescale > 0 else {
+            throw VideoSegmentCache.CacheError.invalidTrack
+        }
+        let mediaStart = indexEnd + 1 + result.sidx.firstOffset
+        var offset = mediaStart
+        var time = 0.0
+        var segments = [VideoSegmentCache.Segment(range: 0..<mediaStart, start: 0, duration: 0)]
+        for entry in result.sidx.segments.prefix(3) {
+            let duration = Double(entry.duration) / Double(result.sidx.timescale)
+            segments.append(.init(range: offset..<(offset + entry.size), start: time, duration: duration))
+            offset += entry.size
+            time += duration
+        }
+        let urls = BilibiliVideoResourceLoaderDelegate.uniqueHostURLs([result.url] + media.playableURLs).compactMap(URL.init(string:))
+        let cache = try VideoSegmentCache(headers: ["User-Agent": Keys.userAgent, "Referer": Keys.referer(for: aid)],
+                                         diagnosticID: "hdr-fixture-\(name)")
+        let file = directory.appendingPathComponent("\(name).mp4")
+        do {
+            try await cache.register(.init(id: name, isVideo: (media.width ?? 0) > 0, isPrimary: true,
+                                           mimeType: media.mime_type, urls: urls, segments: segments))
+            try await cache.prebuffer(at: 0, target: time, minimum: time, maximumWait: 30)
+            var data = Data()
+            for index in segments.indices {
+                let response = try await cache.response(track: name, index: index, rangeHeader: nil)
+                data.append(response.data)
+            }
+            try data.write(to: file, options: .atomic)
+            await cache.stop()
+            var playlist = """
+            #EXTM3U
+            #EXT-X-VERSION:7
+            #EXT-X-TARGETDURATION:\(result.sidx.maxSegmentDuration() ?? 6)
+            #EXT-X-MEDIA-SEQUENCE:1
+            #EXT-X-INDEPENDENT-SEGMENTS
+            #EXT-X-PLAYLIST-TYPE:VOD
+            #EXT-X-MAP:URI="\(name).mp4",BYTERANGE="\(initialization[1] - initialization[0] + 1)@\(initialization[0])"
+
+            """
+            for segment in segments.dropFirst() {
+                playlist += "#EXTINF:\(segment.duration),\n#EXT-X-BYTERANGE:\(segment.range.count)@\(segment.range.lowerBound)\n\(name).mp4\n"
+            }
+            playlist += "#EXT-X-ENDLIST\n"
+            Logger.info("[hdr-fixture] name=\(name) codec=\(media.codecs) bytes=\(data.count) seconds=\(time) sourceFPS=\(media.frame_rate ?? "-")")
+            return HDRPlaybackTestFixture(file: file, playlist: playlist, payload: data, mimeType: media.mime_type)
+        } catch {
+            await cache.stop()
+            throw error
+        }
+    }
+
+    func response(_ request: HttpRequest) -> HttpResponse {
+        do {
+            Logger.info("[hdr-matrix-http] file=\(file.lastPathComponent) method=\(request.method) range=\(request.headers["range"] ?? "all")")
+            let range = try VideoSegmentCache.responseRange(request.headers["range"], length: payload.count)
+            var headers = ["Content-Length": "\(range.count)", "Content-Type": mimeType, "Accept-Ranges": "bytes"]
+            if request.headers["range"] != nil {
+                headers["Content-Range"] = "bytes \(range.lowerBound)-\(range.upperBound - 1)/\(payload.count)"
+            }
+            return .raw(request.headers["range"] == nil ? 200 : 206, "OK", headers) { writer in
+                if request.method != "HEAD" { try writer.write(payload.subdata(in: range)) }
+            }
+        } catch {
+            Logger.warn("[hdr-fixture] invalid local range: \(PlaybackDiagnostics.error(error))")
+            return .raw(416, "Range Not Satisfiable", ["Content-Length": "0"], nil)
+        }
+    }
 }
 
 private final class SegmentCacheTestOrigin: @unchecked Sendable {

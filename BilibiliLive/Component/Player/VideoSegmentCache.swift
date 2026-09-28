@@ -94,6 +94,43 @@ actor VideoSegmentCache {
         let source: Int
         let host: String
         let totalSize: Int
+        let elapsed: TimeInterval
+        let failedSources: [Int]
+    }
+
+    struct SourceHealth {
+        private var rates = [Int: Double]()
+        private var retryAfter = [Int: Date]()
+        private var selections = 0
+
+        mutating func select(count: Int, inFlight: Set<Int>, now: Date = Date()) -> Int {
+            let available = (0..<count).filter { retryAfter[$0].map { $0 <= now } ?? true }
+            let candidates = available.isEmpty ? Array(0..<count) : available
+            selections += 1
+            if let unmeasured = candidates.first(where: { rates[$0] == nil && !inFlight.contains($0) }) {
+                return unmeasured
+            }
+            let ranked = candidates.sorted {
+                let lhs = rates[$0] ?? 0
+                let rhs = rates[$1] ?? 0
+                return lhs == rhs ? $0 < $1 : lhs > rhs
+            }
+            // Re-evaluate alternatives with useful media, never extra probes.
+            if selections.isMultiple(of: 16),
+               let alternate = ranked.dropFirst().first(where: { !inFlight.contains($0) }) {
+                return alternate
+            }
+            return ranked.first ?? 0
+        }
+
+        mutating func record(source: Int, bytes: Int, elapsed: TimeInterval,
+                             failedSources: [Int], now: Date = Date()) {
+            for failed in failedSources { retryAfter[failed] = now.addingTimeInterval(15) }
+            retryAfter[source] = nil
+            guard bytes >= 32 * 1024, elapsed.isFinite, elapsed > 0 else { return }
+            let rate = Double(bytes) / elapsed
+            rates[source] = rates[source].map { $0 * 0.65 + rate * 0.35 } ?? rate
+        }
     }
 
     private final class DownloadValidator: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
@@ -140,6 +177,7 @@ actor VideoSegmentCache {
     private struct Job {
         let token: UUID
         let bytes: Int
+        let source: Int
         let task: Task<Void, Never>
     }
 
@@ -152,7 +190,7 @@ actor VideoSegmentCache {
     private let monitor: VideoSegmentCacheMonitor
     private var tracks = [String: Track]()
     private var activeTracks = Set<String>()
-    private var preferredSources = [String: Int]()
+    private var sourceHealth = [String: SourceHealth]()
     private var totalSizes = [String: Int]()
     private var entries = [Key: Entry]()
     private var jobs = [Key: Job]()
@@ -185,7 +223,7 @@ actor VideoSegmentCache {
 
     init(directory: URL? = nil, headers: [String: String], diagnosticID: String,
          monitor: VideoSegmentCacheMonitor = VideoSegmentCacheMonitor(),
-         maximumBytes: Int = 1024 * 1024 * 1024, concurrency: Int = 4) throws {
+         maximumBytes: Int = 1024 * 1024 * 1024, concurrency: Int = 8) throws {
         let base = try directory ?? FileManager.default.url(for: .cachesDirectory,
                                                             in: .userDomainMask,
                                                             appropriateFor: nil, create: true)
@@ -448,7 +486,10 @@ actor VideoSegmentCache {
                 guard state.storedBytes + reserved + bytes <= maximumBytes else { continue }
             }
             let token = UUID()
-            let source = preferredSources[key.track] ?? 0
+            var health = sourceHealth[key.track] ?? SourceHealth()
+            let activeSources = Set(jobs.compactMap { $0.key.track == key.track ? $0.value.source : nil })
+            let source = health.select(count: track.urls.count, inFlight: activeSources)
+            sourceHealth[key.track] = health
             let expectedTotal = totalSizes[key.track]
             let directory = directory
             let session = session
@@ -463,7 +504,7 @@ actor VideoSegmentCache {
                 } catch { result = .failure(error) }
                 await self?.complete(key: key, token: token, result: result)
             }
-            jobs[key] = Job(token: token, bytes: bytes, task: task)
+            jobs[key] = Job(token: token, bytes: bytes, source: source, task: task)
         }
         if retryTask == nil, wanted.contains(where: { retryAfter[$0] != nil }) {
             retryTask = Task { [weak self] in
@@ -498,7 +539,9 @@ actor VideoSegmentCache {
             entries[key] = Entry(file: download.file, bytes: download.bytes)
             state.storedBytes += download.bytes
             totalSizes[key.track] = download.totalSize
-            preferredSources[key.track] = download.source
+            sourceHealth[key.track, default: SourceHealth()].record(
+                source: download.source, bytes: download.bytes, elapsed: download.elapsed,
+                failedSources: download.failedSources)
             retryAfter[key] = nil
             if tracks[key.track]?.isVideo == true { state.videoHost = download.host }
             else { state.audioHost = download.host }
@@ -526,6 +569,7 @@ actor VideoSegmentCache {
         let range = startOffset..<min(segment.range.upperBound, startOffset + downloadChunkBytes)
         let sources = [preferredSource] + track.urls.indices.filter { $0 != preferredSource }
         var lastError = "no available CDN"
+        var failedSources = [Int]()
         for source in sources {
             try Task.checkCancellation()
             let url = track.urls[source]
@@ -557,7 +601,8 @@ actor VideoSegmentCache {
                 let elapsed = ProcessInfo.processInfo.systemUptime - start
                 let actualHost = response.url?.host ?? host
                 Logger.info("[segment-cache] id=\(diagnosticID) track=\(track.id) segment=\(index) offset=\(offset) host=\(actualHost) bytes=\(size.intValue) mediaSeconds=\(segment.duration) elapsed=\(elapsed)s totalMbps=\(Double(size.intValue) * 8 / max(elapsed, 0.001) / 1_000_000) alternate=\(source != preferredSource)")
-                return Download(file: destination, bytes: size.intValue, source: source, host: actualHost, totalSize: total)
+                return Download(file: destination, bytes: size.intValue, source: source, host: actualHost,
+                                totalSize: total, elapsed: elapsed, failedSources: failedSources)
             } catch {
                 if let temporaryFile {
                     do { try FileManager.default.removeItem(at: temporaryFile) }
@@ -565,6 +610,7 @@ actor VideoSegmentCache {
                 }
                 try Task.checkCancellation()
                 lastError = PlaybackDiagnostics.error(validator.error ?? error)
+                failedSources.append(source)
                 Logger.warn("[segment-cache] id=\(diagnosticID) track=\(track.id) segment=\(index) offset=\(offset) host=\(host) retry-next-CDN error=\(lastError)")
             }
         }

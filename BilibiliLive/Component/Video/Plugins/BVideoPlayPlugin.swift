@@ -408,10 +408,10 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         guard let error = error as NSError?, error.domain == AVFoundationErrorDomain else { return nil }
         switch error.code {
         case AVError.Code.noCompatibleAlternatesForExternalDisplay.rawValue:
-            return "当前电视连接不支持此视频的 HDR／帧率组合，换 CDN 无法解决。未自动降低清晰度；请检查电视的 HDR 与匹配内容设置，或手动选择兼容格式。"
+            return "当前 HDR／帧率声明未通过播放器与显示输出协商，换 CDN 无法解决。未自动降低清晰度；请手动选择兼容格式。"
         case AVError.Code.incompatibleAsset.rawValue, AVError.Code.decoderNotFound.rawValue,
              AVError.Code.formatUnsupported.rawValue:
-            return "此 Apple TV 无法播放当前编码或格式，换 CDN 无法解决。未自动降低清晰度；请手动选择兼容格式。"
+            return "播放器未接受当前编码或格式，换 CDN 无法解决。未自动降低清晰度；请手动选择兼容格式。"
         default:
             return nil
         }
