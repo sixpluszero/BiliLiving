@@ -6,6 +6,72 @@ import CocoaAsyncSocket
 @testable import BilibiliLive
 
 final class BiliLivingTests: XCTestCase {
+    func testCacheTransferTraceDistinguishesQueueFirstByteAndIdleTime() {
+        let trace = CacheTransferTrace(context: "id=test", scheduledAt: 10)
+        XCTAssertTrue(trace.snapshot.fields(at: 11).contains("phase=scheduled"))
+        trace.begin(host: "cdn.example", source: 0, now: 11)
+        XCTAssertTrue(trace.snapshot.fields(at: 12).contains("phase=not-observed"))
+        trace.progress(totalBytes: 0, taskID: 7, now: 12)
+        XCTAssertTrue(trace.snapshot.fields(at: 12).contains("phase=awaiting-bytes"))
+        trace.progress(totalBytes: 100, taskID: 7, now: 12)
+        trace.progress(totalBytes: 100, taskID: 7, now: 14)
+        XCTAssertEqual(trace.snapshot.firstByteAt, 12)
+        XCTAssertEqual(trace.snapshot.lastByteAt, 12, "Repeated counters do not mean bytes are arriving")
+        XCTAssertEqual(trace.snapshot.receivedBytes, 100)
+        XCTAssertTrue(trace.snapshot.fields(at: 15).contains("lastIncreaseObservedMs=3000"))
+        trace.progress(totalBytes: 150, taskID: 7, now: 15)
+        XCTAssertEqual(trace.snapshot.lastByteAt, 15)
+        trace.begin(host: "alternate.example", source: 1, now: 16)
+        XCTAssertEqual(trace.snapshot.attempt, 2)
+        XCTAssertEqual(trace.snapshot.receivedBytes, 0)
+        XCTAssertNil(trace.snapshot.firstByteAt)
+        XCTAssertFalse(trace.snapshot.progressObserved)
+        XCTAssertEqual(trace.snapshot.scheduledAt, 10)
+    }
+
+    func testCacheDiagnosticsSeparateContinuousGapFromResidentAndValidatedBytes() async throws {
+        let origin = try SegmentCacheTestOrigin(failingOffset: 8)
+        let cache = try VideoSegmentCache(headers: [:], diagnosticID: "diagnostic-gap", diagnosticsEnabled: true)
+        addTeardownBlock { await cache.stop(); origin.stop() }
+        try await cache.register(origin.track())
+        try await cache.prebuffer(at: 0, target: 20, minimum: 20, maximumWait: 0.5)
+        let snapshot = await cache.diagnosticWindow(at: 2)
+        XCTAssertEqual(snapshot.cachePosition, 0, "Sampling must not advance the scheduler's playback position")
+        XCTAssertEqual(snapshot.playerPosition, 2)
+        XCTAssertEqual(snapshot.bufferedSeconds, 3, accuracy: 0.01)
+        let gap = try XCTUnwrap(snapshot.gaps.first)
+        XCTAssertEqual(gap.segment, 2)
+        XCTAssertEqual(gap.start, 5)
+        XCTAssertEqual(gap.cachedBytes, 0)
+        XCTAssertEqual(gap.firstMissingOffset, 0)
+        XCTAssertGreaterThan(gap.cachedBytesBeyondGap, 0)
+        XCTAssertEqual(snapshot.validatedBytes, snapshot.residentBytes + snapshot.evictedBytes)
+        XCTAssertGreaterThanOrEqual(snapshot.capturedAt, snapshot.positionUpdatedAt)
+    }
+
+    func testCacheDiagnosticSamplingDoesNotScheduleDownloads() async throws {
+        let origin = try SegmentCacheTestOrigin()
+        let monitor = VideoSegmentCacheMonitor()
+        let cache = try VideoSegmentCache(headers: [:], diagnosticID: "diagnostic-passive",
+                                         monitor: monitor, diagnosticsEnabled: true)
+        addTeardownBlock { await cache.stop(); origin.stop() }
+        try await cache.register(origin.track())
+        try await cache.prebuffer(at: 0, target: 15, minimum: 15, maximumWait: 3)
+        let requests = origin.requestCount
+        let visible = monitor.value
+        await cache.logDiagnostics(playerPosition: 40, nativeBuffer: 0, control: "waiting",
+                                   trigger: "test", sampledAt: ProcessInfo.processInfo.systemUptime,
+                                   visibleSnapshot: visible)
+        let snapshot = await cache.diagnosticWindow(at: 40)
+        XCTAssertEqual(snapshot.cachePosition, 0)
+        XCTAssertEqual(origin.requestCount, requests)
+        XCTAssertEqual(monitor.value.capturedAt, visible.capturedAt, "Reading diagnostic state must not publish new UI state")
+        await cache.stop()
+        let stopped = await cache.diagnosticWindow(at: 40)
+        XCTAssertEqual(stopped.residentBytes, 0)
+        XCTAssertEqual(stopped.validatedBytes, stopped.evictedBytes)
+    }
+
     func testSegmentCacheValidatesRemoteAndLocalByteRanges() throws {
         let url = try XCTUnwrap(URL(string: "https://example.invalid/media"))
         let valid = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 206, httpVersion: nil,

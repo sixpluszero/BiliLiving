@@ -43,6 +43,7 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     private var recoveryState = PlaybackRecoveryState()
     private var rateChangeObserver: NSObjectProtocol?
     private var cacheTimeObserver: NSObjectProtocol?
+    private var cacheDiagnosticObserver: NSKeyValueObservation?
     private weak var failedPlaybackItem: AVPlayerItem?
     private var lastPlaybackError: String?
     private var isPreparingMedia = false
@@ -195,6 +196,15 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         lastStalls = 0
         lastDroppedFrames = 0
         stallUnhealthyStreak = 0
+        cacheDiagnosticObserver = nil
+        if VideoCacheDiagnostics.enabled {
+            cacheDiagnosticObserver = player.observe(\.timeControlStatus, options: [.new]) { [weak self, weak player] _, _ in
+                DispatchQueue.main.async {
+                    guard let self, let player, self.playerVC?.player === player else { return }
+                    self.logCacheDiagnostics(player: player, trigger: "time-control")
+                }
+            }
+        }
         if let rateChangeObserver { NotificationCenter.default.removeObserver(rateChangeObserver) }
         if let cacheTimeObserver { NotificationCenter.default.removeObserver(cacheTimeObserver) }
         cacheTimeObserver = NotificationCenter.default.addObserver(
@@ -232,6 +242,7 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         rateChangeObserver = nil
         if let cacheTimeObserver { NotificationCenter.default.removeObserver(cacheTimeObserver) }
         cacheTimeObserver = nil
+        cacheDiagnosticObserver = nil
         player.pause()
         player.replaceCurrentItem(with: nil)
     }
@@ -325,11 +336,28 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         lastStalls = stalls
         lastDroppedFrames = dropped
         updateCachePosition(player: player)
+        logCacheDiagnostics(player: player, trigger: "tick")
         if let cache = playerDelegate?.cacheSnapshot {
             Logger.info("[playback-cache] position=\(cache.position) buffered=\(cache.bufferedSeconds)s target=\(cache.targetSeconds)s bytes=\(cache.storedBytes) downloads=\(cache.activeDownloads) hits=\(cache.hits) misses=\(cache.misses) videoHost=\(cache.videoHost ?? "-") audioHost=\(cache.audioHost ?? "-")")
         }
 
         checkStallHealth(stallDelta: stallDelta, buffered: buffered)
+    }
+
+    private func logCacheDiagnostics(player: AVPlayer, trigger: String) {
+        guard VideoCacheDiagnostics.enabled, let item = player.currentItem else { return }
+        let position = player.currentTime().seconds
+        guard position.isFinite, position >= 0 else { return }
+        let control: String
+        switch player.timeControlStatus {
+        case .paused: control = "paused"
+        case .waitingToPlayAtSpecifiedRate: control = "waiting"
+        case .playing: control = "playing"
+        @unknown default: control = "unknown"
+        }
+        playerDelegate?.logCachedPlayback(at: position, nativeBuffer: bufferedSeconds(of: item),
+                                          control: control, trigger: trigger,
+                                          sampledAt: ProcessInfo.processInfo.systemUptime)
     }
 
     private var isUserPaused: Bool {

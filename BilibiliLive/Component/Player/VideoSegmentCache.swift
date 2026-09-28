@@ -2,6 +2,8 @@ import Foundation
 import Swifter
 
 struct VideoSegmentCacheSnapshot: Sendable {
+    var capturedAt = 0.0
+    var positionUpdatedAt = 0.0
     var position = 0.0
     var bufferedSeconds = 0.0
     var targetSeconds = 0.0
@@ -131,6 +133,12 @@ actor VideoSegmentCache {
             let rate = Double(bytes) / elapsed
             rates[source] = rates[source].map { $0 * 0.65 + rate * 0.35 } ?? rate
         }
+
+        func diagnosticFields(source: Int, now: Date) -> String {
+            let mbps = rates[source].map { $0 * 8 / 1_000_000 } ?? -1
+            let cooldown = retryAfter[source].map { max(0, $0.timeIntervalSince(now)) } ?? 0
+            return "rankMbps=\(mbps) cooldownSeconds=\(cooldown) selections=\(selections)"
+        }
     }
 
     private final class DownloadValidator: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
@@ -138,10 +146,12 @@ actor VideoSegmentCache {
         private let totalSize: Int?
         private let lock = NSLock()
         private var failure: Error?
+        private let trace: CacheTransferTrace?
 
-        init(range: Range<Int>, totalSize: Int?) {
+        init(range: Range<Int>, totalSize: Int?, trace: CacheTransferTrace?) {
             self.range = range
             self.totalSize = totalSize
+            self.trace = trace
         }
 
         var error: Error? {
@@ -153,6 +163,7 @@ actor VideoSegmentCache {
         func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                         didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
                         totalBytesExpectedToWrite: Int64) {
+            trace?.progress(totalBytes: Int(totalBytesWritten), taskID: downloadTask.taskIdentifier)
             do {
                 guard totalBytesWritten <= range.count,
                       let response = downloadTask.response as? HTTPURLResponse else {
@@ -172,12 +183,20 @@ actor VideoSegmentCache {
 
         func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                         didFinishDownloadingTo location: URL) {}
+
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        didFinishCollecting metrics: URLSessionTaskMetrics) {
+            trace?.progress(totalBytes: Int(task.countOfBytesReceived), taskID: task.taskIdentifier,
+                            taskState: String(task.state.rawValue))
+            trace?.collected(metrics)
+        }
     }
 
     private struct Job {
         let token: UUID
         let bytes: Int
         let source: Int
+        let trace: CacheTransferTrace?
         let task: Task<Void, Never>
     }
 
@@ -188,6 +207,7 @@ actor VideoSegmentCache {
     private let concurrency: Int
     private let diagnosticID: String
     private let monitor: VideoSegmentCacheMonitor
+    private let diagnosticsEnabled: Bool
     private var tracks = [String: Track]()
     private var activeTracks = Set<String>()
     private var sourceHealth = [String: SourceHealth]()
@@ -204,6 +224,11 @@ actor VideoSegmentCache {
     private var prefetchEnabled = false
     private var stopped = false
     private var state = VideoSegmentCacheSnapshot()
+    private var positionUpdatedAt = ProcessInfo.processInfo.systemUptime
+    private var validatedBytes = 0
+    private var evictedBytes = 0
+    private var diagnosticSequence = 0
+    private var lastDiagnosticSample: (time: TimeInterval, validatedBytes: Int)?
 
     static func removeAbandonedCaches() {
         do {
@@ -223,7 +248,8 @@ actor VideoSegmentCache {
 
     init(directory: URL? = nil, headers: [String: String], diagnosticID: String,
          monitor: VideoSegmentCacheMonitor = VideoSegmentCacheMonitor(),
-         maximumBytes: Int = 1024 * 1024 * 1024, concurrency: Int = 8) throws {
+         maximumBytes: Int = 1024 * 1024 * 1024, concurrency: Int = 8,
+         diagnosticsEnabled: Bool = VideoCacheDiagnostics.enabled) throws {
         let base = try directory ?? FileManager.default.url(for: .cachesDirectory,
                                                             in: .userDomainMask,
                                                             appropriateFor: nil, create: true)
@@ -231,6 +257,7 @@ actor VideoSegmentCache {
         self.headers = headers
         self.diagnosticID = diagnosticID
         self.monitor = monitor
+        self.diagnosticsEnabled = diagnosticsEnabled
         self.maximumBytes = max(1, maximumBytes)
         self.concurrency = max(1, concurrency)
         let configuration = URLSessionConfiguration.ephemeral
@@ -267,6 +294,7 @@ actor VideoSegmentCache {
         }
         guard !stopped else { throw CancellationError() }
         position = time
+        positionUpdatedAt = ProcessInfo.processInfo.systemUptime
         self.target = target
         prefetchEnabled = true
         trimObsoleteEntries()
@@ -290,6 +318,7 @@ actor VideoSegmentCache {
     func updatePosition(_ time: Double, target: Double) {
         guard !stopped, time.isFinite, time >= 0, target.isFinite, target > 0 else { return }
         position = time
+        positionUpdatedAt = ProcessInfo.processInfo.systemUptime
         self.target = target
         trimObsoleteEntries()
         pump()
@@ -373,7 +402,10 @@ actor VideoSegmentCache {
         stopped = true
         retryTask?.cancel()
         retryTask = nil
-        jobs.values.forEach { $0.task.cancel() }
+        for (key, job) in jobs {
+            logCancellation(key, job: job, reason: "teardown")
+            job.task.cancel()
+        }
         jobs.removeAll()
         session.invalidateAndCancel()
         waiters.values.flatMap(\.values).forEach { $0.resume(throwing: CancellationError()) }
@@ -381,6 +413,7 @@ actor VideoSegmentCache {
         demandOrder.removeAll()
         previewOrder.removeAll()
         entries.removeAll()
+        evictedBytes += state.storedBytes
         state.storedBytes = 0
         removeFile(directory)
         publish()
@@ -400,6 +433,10 @@ actor VideoSegmentCache {
             }
         }
         state.misses += 1
+        let requestedAt = ProcessInfo.processInfo.systemUptime
+        if diagnosticsEnabled {
+            Logger.info("[cache-demand] id=\(diagnosticID) track=\(key.track) segment=\(key.index) offset=\(key.offset) kind=\(isPreview ? "preview" : "media") joinedJob=\(jobs[key] != nil) uptime=\(requestedAt)")
+        }
         let token = UUID()
         return try await withTaskCancellationHandler {
             try Task.checkCancellation()
@@ -461,6 +498,7 @@ actor VideoSegmentCache {
         let wanted = wantedKeys()
         let wantedSet = Set(wanted)
         for (key, job) in jobs where waiters[key] == nil && !wantedSet.contains(key) {
+            logCancellation(key, job: job, reason: "outside-window")
             job.task.cancel()
             jobs[key] = nil
         }
@@ -469,7 +507,10 @@ actor VideoSegmentCache {
                abs((tracks[$0.track]?.segments[$0.index].start ?? 0) - position)
                    < abs((tracks[$1.track]?.segments[$1.index].start ?? 0) - position)
            }) {
-            jobs.removeValue(forKey: victim)?.task.cancel()
+            if let job = jobs.removeValue(forKey: victim) {
+                logCancellation(victim, job: job, reason: "preempted-by-demand")
+                job.task.cancel()
+            }
         }
         var candidates = demandOrder + wanted.filter { !demandOrder.contains($0) }
         let previews = previewOrder.filter { !candidates.contains($0) }
@@ -495,16 +536,21 @@ actor VideoSegmentCache {
             let session = session
             let headers = headers
             let diagnosticID = diagnosticID
+            let segment = track.segments[key.index]
+            let role = demandOrder.contains(key) ? "demand" : wantedSet.contains(key) ? "prefetch" : "preview"
+            let trace = diagnosticsEnabled ? CacheTransferTrace(
+                context: "id=\(diagnosticID) job=\(token.uuidString.prefix(8)) track=\(key.track) segment=\(key.index) offset=\(key.offset) expected=\(bytes) role=\(role) mediaStart=\(segment.start) mediaEnd=\(segment.end) scheduledPosition=\(position)"
+            ) : nil
             let task = Task { [weak self] in
                 let result: Result<Download, Error>
                 do {
                     result = .success(try await Self.download(track: track, index: key.index, offset: key.offset,
                         preferredSource: source, expectedTotal: expectedTotal, session: session,
-                        headers: headers, directory: directory, diagnosticID: diagnosticID))
+                        headers: headers, directory: directory, diagnosticID: diagnosticID, trace: trace))
                 } catch { result = .failure(error) }
                 await self?.complete(key: key, token: token, result: result)
             }
-            jobs[key] = Job(token: token, bytes: bytes, source: source, task: task)
+            jobs[key] = Job(token: token, bytes: bytes, source: source, trace: trace, task: task)
         }
         if retryTask == nil, wanted.contains(where: { retryAfter[$0] != nil }) {
             retryTask = Task { [weak self] in
@@ -537,6 +583,7 @@ actor VideoSegmentCache {
                 throw CacheError.invalidResponse("CDN resources have different lengths")
             }
             entries[key] = Entry(file: download.file, bytes: download.bytes)
+            validatedBytes += download.bytes
             state.storedBytes += download.bytes
             totalSizes[key.track] = download.totalSize
             sourceHealth[key.track, default: SourceHealth()].record(
@@ -563,7 +610,7 @@ actor VideoSegmentCache {
 
     private static func download(track: Track, index: Int, offset: Int, preferredSource: Int, expectedTotal: Int?,
                                  session: URLSession, headers: [String: String], directory: URL,
-                                 diagnosticID: String) async throws -> Download {
+                                 diagnosticID: String, trace: CacheTransferTrace?) async throws -> Download {
         let segment = track.segments[index]
         let startOffset = segment.range.lowerBound + offset
         let range = startOffset..<min(segment.range.upperBound, startOffset + downloadChunkBytes)
@@ -575,7 +622,8 @@ actor VideoSegmentCache {
             let url = track.urls[source]
             let host = url.host ?? "-"
             let start = ProcessInfo.processInfo.systemUptime
-            let validator = DownloadValidator(range: range, totalSize: expectedTotal)
+            trace?.begin(host: host, source: source)
+            let validator = DownloadValidator(range: range, totalSize: expectedTotal, trace: trace)
             var temporaryFile: URL?
             do {
                 var request = URLRequest(url: url)
@@ -600,6 +648,7 @@ actor VideoSegmentCache {
                 temporaryFile = nil
                 let elapsed = ProcessInfo.processInfo.systemUptime - start
                 let actualHost = response.url?.host ?? host
+                trace?.finish(outcome: "validated")
                 Logger.info("[segment-cache] id=\(diagnosticID) track=\(track.id) segment=\(index) offset=\(offset) host=\(actualHost) bytes=\(size.intValue) mediaSeconds=\(segment.duration) elapsed=\(elapsed)s totalMbps=\(Double(size.intValue) * 8 / max(elapsed, 0.001) / 1_000_000) alternate=\(source != preferredSource)")
                 return Download(file: destination, bytes: size.intValue, source: source, host: actualHost,
                                 totalSize: total, elapsed: elapsed, failedSources: failedSources)
@@ -608,6 +657,7 @@ actor VideoSegmentCache {
                     do { try FileManager.default.removeItem(at: temporaryFile) }
                     catch { Logger.warn("[segment-cache] temporary file cleanup: \(PlaybackDiagnostics.error(error))") }
                 }
+                trace?.finish(outcome: Task.isCancelled ? "cancelled" : "failed", error: validator.error ?? error)
                 try Task.checkCancellation()
                 lastError = PlaybackDiagnostics.error(validator.error ?? error)
                 failedSources.append(source)
@@ -617,8 +667,9 @@ actor VideoSegmentCache {
         throw CacheError.unavailable(lastError)
     }
 
-    private func forwardBuffer() -> Double {
-        activeTracks.compactMap { id -> Double? in
+    private func forwardBuffer(at time: Double? = nil) -> Double {
+        let position = time ?? self.position
+        return activeTracks.compactMap { id -> Double? in
             guard let track = tracks[id] else { return nil }
             guard hasSegment(track: track, index: 0) else { return 0 }
             var end = position
@@ -653,6 +704,7 @@ actor VideoSegmentCache {
     private func removeEntry(_ key: Key) {
         guard let entry = entries.removeValue(forKey: key) else { return }
         state.storedBytes -= entry.bytes
+        evictedBytes += entry.bytes
         removeFile(entry.file)
     }
 
@@ -662,7 +714,102 @@ actor VideoSegmentCache {
         catch { Logger.warn("[segment-cache] file cleanup failed: \(PlaybackDiagnostics.error(error))") }
     }
 
+    func diagnosticWindow(at playerPosition: Double) -> VideoCacheDiagnostics.Window {
+        let now = ProcessInfo.processInfo.systemUptime
+        let wanted = wantedKeys()
+        let pending = wanted.filter { entries[$0] == nil && jobs[$0] == nil }
+        let gaps = activeTracks.sorted().compactMap { id -> VideoCacheDiagnostics.Gap? in
+            guard let track = tracks[id],
+                  let index = track.segments.indices.first(where: {
+                      ($0 == 0 || track.segments[$0].end > playerPosition) && !hasSegment(track: track, index: $0)
+                  }) else { return nil }
+            let segment = track.segments[index]
+            let keys = chunkKeys(track: track, index: index)
+            let missing = keys.filter { entries[$0] == nil }
+            guard let first = missing.first else { return nil }
+            let status: String
+            if jobs[first] != nil { status = "in-flight" }
+            else if retryAfter[first].map({ $0 > Date() }) ?? false { status = "cooldown" }
+            else if waiters[first] != nil { status = "queued-demand" }
+            else { status = "pending-prefetch" }
+            let beyond = entries.reduce(0) { total, entry in
+                total + (entry.key.track == id && entry.key.index > index ? entry.value.bytes : 0)
+            }
+            return .init(track: id, isVideo: track.isVideo, segment: index,
+                         start: segment.start, end: segment.end, requiredBytes: segment.range.count,
+                         cachedBytes: keys.reduce(0) { $0 + (entries[$1]?.bytes ?? 0) },
+                         missingBlocks: missing.count, firstMissingOffset: first.offset,
+                         firstMissingState: status, cachedBytesBeyondGap: beyond)
+        }
+        return .init(capturedAt: now, positionUpdatedAt: positionUpdatedAt,
+                     playerPosition: playerPosition, cachePosition: position,
+                     bufferedSeconds: forwardBuffer(at: playerPosition),
+                     residentBytes: state.storedBytes, validatedBytes: validatedBytes, evictedBytes: evictedBytes,
+                     activeDownloads: jobs.count, pendingBlocks: pending.count,
+                     cooldownBlocks: pending.filter { retryAfter[$0].map { $0 > Date() } ?? false }.count,
+                     reservedBytes: jobs.values.reduce(0) { $0 + $1.bytes }, gaps: gaps)
+    }
+
+    func logDiagnostics(playerPosition: Double, nativeBuffer: Double, control: String, trigger: String,
+                        sampledAt: TimeInterval, visibleSnapshot: VideoSegmentCacheSnapshot?) async {
+        guard diagnosticsEnabled else { return }
+        // Async URLSession download APIs do not consistently forward download
+        // progress to the per-task delegate. Read actual task counters instead.
+        let tasks: [URLSessionTask] = await withCheckedContinuation { continuation in
+            session.getAllTasks { continuation.resume(returning: $0) }
+        }
+        let observedAt = ProcessInfo.processInfo.systemUptime
+        for (key, job) in jobs {
+            guard let trace = job.trace, let track = tracks[key.track] else { continue }
+            let source = trace.snapshot.source
+            guard track.urls.indices.contains(source) else { continue }
+            let start = track.segments[key.index].range.lowerBound + key.offset
+            let expectedRange = "bytes=\(start)-\(start + job.bytes - 1)"
+            if let task = tasks.first(where: {
+                $0.state != .canceling && $0.state != .completed
+                    && $0.originalRequest?.url == track.urls[source]
+                    && $0.originalRequest?.value(forHTTPHeaderField: "Range") == expectedRange
+            }) {
+                trace.progress(totalBytes: Int(task.countOfBytesReceived), taskID: task.taskIdentifier,
+                               taskState: String(task.state.rawValue), now: observedAt)
+            }
+        }
+        let window = diagnosticWindow(at: playerPosition)
+        diagnosticSequence += 1
+        let sequence = diagnosticSequence
+        let now = window.capturedAt
+        let sampleSeconds = lastDiagnosticSample.map { now - $0.time } ?? 0
+        let newBytes = lastDiagnosticSample.map { validatedBytes - $0.validatedBytes } ?? 0
+        let mbps = sampleSeconds > 0.1 ? Double(newBytes) * 8 / sampleSeconds / 1_000_000 : -1
+        lastDiagnosticSample = (now, validatedBytes)
+        let visibleAge = visibleSnapshot.map { max(0, sampledAt - $0.capturedAt) * 1000 } ?? -1
+        Logger.info("[cache-window] id=\(diagnosticID) seq=\(sequence) trigger=\(trigger) control=\(control) sampledAt=\(sampledAt) capturedAt=\(now) actorDelayMs=\((now - sampledAt) * 1000) playerPosition=\(playerPosition) cachePosition=\(position) positionAgeMs=\((now - positionUpdatedAt) * 1000) nativeSeconds=\(nativeBuffer) continuousSeconds=\(window.bufferedSeconds) targetSeconds=\(target) residentBytes=\(state.storedBytes) validatedBytes=\(validatedBytes) evictedBytes=\(evictedBytes) intervalSeconds=\(sampleSeconds) validatedMbps=\(mbps) active=\(jobs.count) limit=\(concurrency) pending=\(window.pendingBlocks) cooldown=\(window.cooldownBlocks) reservedBytes=\(window.reservedBytes) budgetBytes=\(maximumBytes) visibleAgeMs=\(visibleAge) visiblePosition=\(visibleSnapshot?.position ?? -1) visibleSeconds=\(visibleSnapshot?.bufferedSeconds ?? -1) visibleResidentBytes=\(visibleSnapshot?.storedBytes ?? -1)")
+        for gap in window.gaps {
+            Logger.info("[cache-gap] id=\(diagnosticID) seq=\(sequence) track=\(gap.track) kind=\(gap.isVideo ? "video" : "audio") segment=\(gap.segment) start=\(gap.start) end=\(gap.end) leadSeconds=\(gap.start - playerPosition) requiredBytes=\(gap.requiredBytes) cachedBytes=\(gap.cachedBytes) missingBlocks=\(gap.missingBlocks) firstMissingOffset=\(gap.firstMissingOffset) firstMissingState=\(gap.firstMissingState) beyondGapBytes=\(gap.cachedBytesBeyondGap)")
+        }
+        for (key, job) in jobs.sorted(by: { ($0.key.track, $0.key.index, $0.key.offset) < ($1.key.track, $1.key.index, $1.key.offset) }) {
+            let role = demandOrder.contains(key) ? "demand" : previewOrder.contains(key) ? "preview" : "prefetch"
+            let lead = (tracks[key.track]?.segments[key.index].start).map { $0 - playerPosition } ?? 0
+            Logger.info("[cache-inflight] id=\(diagnosticID) seq=\(sequence) job=\(job.token.uuidString.prefix(8)) track=\(key.track) segment=\(key.index) offset=\(key.offset) expected=\(job.bytes) role=\(role) waiters=\(waiters[key]?.count ?? 0) leadSeconds=\(lead) \(job.trace?.snapshot.fields(at: now) ?? "trace=disabled")")
+        }
+        let date = Date()
+        for id in activeTracks.sorted() {
+            guard let track = tracks[id] else { continue }
+            for (source, url) in track.urls.enumerated() {
+                Logger.info("[cache-cdn-rank] id=\(diagnosticID) seq=\(sequence) track=\(id) source=\(source) host=\(url.host ?? "-") \(sourceHealth[id]?.diagnosticFields(source: source, now: date) ?? "rankMbps=-1 cooldownSeconds=0 selections=0")")
+            }
+        }
+        Logger.info("[cache-sample-cost] id=\(diagnosticID) seq=\(sequence) elapsedMs=\((ProcessInfo.processInfo.systemUptime - now) * 1000)")
+    }
+
+    private func logCancellation(_ key: Key, job: Job, reason: String) {
+        guard diagnosticsEnabled else { return }
+        Logger.info("[cache-job-cancel] id=\(diagnosticID) job=\(job.token.uuidString.prefix(8)) track=\(key.track) segment=\(key.index) offset=\(key.offset) reason=\(reason) \(job.trace?.snapshot.fields(at: ProcessInfo.processInfo.systemUptime) ?? "-")")
+    }
+
     private func publish() {
+        state.capturedAt = ProcessInfo.processInfo.systemUptime
+        state.positionUpdatedAt = positionUpdatedAt
         state.position = position
         state.bufferedSeconds = forwardBuffer()
         state.targetSeconds = target
@@ -709,6 +856,16 @@ final class VideoSegmentCacheServer: @unchecked Sendable {
                 return .raw(response.status, response.status == 206 ? "Partial Content" : "OK",
                             response.headers) { writer in
                     guard !headOnly else { return }
+                    let started = ProcessInfo.processInfo.systemUptime
+                    let requestID = VideoCacheDiagnostics.enabled ? String(UUID().uuidString.prefix(8)) : ""
+                    var sent = 0
+                    var waitingSeconds = 0.0
+                    var writeSeconds = 0.0
+                    defer {
+                        if VideoCacheDiagnostics.enabled {
+                            Logger.info("[cache-serve] id=\(diagnosticID) request=\(requestID) track=\(track) segment=\(segment) kind=\(kind) expected=\(response.range.count) sent=\(sent) complete=\(sent == response.range.count) cacheWaitMs=\(waitingSeconds * 1000) writeMs=\(writeSeconds * 1000) elapsedMs=\((ProcessInfo.processInfo.systemUptime - started) * 1000)")
+                        }
+                    }
                     // Send headers immediately, then verified chunks as they
                     // arrive. A large fragment must not look like a silent CDN.
                     var offset = response.range.lowerBound
@@ -717,6 +874,7 @@ final class VideoSegmentCacheServer: @unchecked Sendable {
                                       (offset / VideoSegmentCache.downloadChunkBytes + 1) * VideoSegmentCache.downloadChunkBytes)
                         let pending = PendingResponse()
                         let header = "bytes=\(offset)-\(end - 1)"
+                        let requestedAt = ProcessInfo.processInfo.systemUptime
                         let task = Task {
                             do {
                                 pending.finish(.success(try await cache.response(
@@ -728,7 +886,18 @@ final class VideoSegmentCacheServer: @unchecked Sendable {
                             Logger.warn("[segment-cache] local media chunk timed out")
                             throw VideoSegmentCache.CacheError.unavailable("local media chunk timed out")
                         }
-                        do { try writer.write(result.get().data) }
+                        let waited = ProcessInfo.processInfo.systemUptime - requestedAt
+                        waitingSeconds += waited
+                        if VideoCacheDiagnostics.enabled, waited >= 0.25 {
+                            Logger.info("[cache-serve-wait] id=\(diagnosticID) request=\(requestID) track=\(track) segment=\(segment) offset=\(offset) bytes=\(end - offset) cacheWaitMs=\(waited * 1000)")
+                        }
+                        do {
+                            let data = try result.get().data
+                            let writingAt = ProcessInfo.processInfo.systemUptime
+                            try writer.write(data)
+                            writeSeconds += ProcessInfo.processInfo.systemUptime - writingAt
+                            sent += data.count
+                        }
                         catch {
                             task.cancel()
                             Logger.warn("[segment-cache] local media stream interrupted: \(PlaybackDiagnostics.error(error))")

@@ -557,6 +557,17 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         Task { await cache.updatePosition(position, target: target) }
     }
 
+    func logCachedPlayback(at position: Double, nativeBuffer: Double, control: String,
+                           trigger: String, sampledAt: TimeInterval) {
+        guard VideoCacheDiagnostics.enabled, let server = segmentCacheServer else { return }
+        let visible = server.monitor.value
+        Task {
+            await server.cache.logDiagnostics(playerPosition: position, nativeBuffer: nativeBuffer,
+                                               control: control, trigger: trigger, sampledAt: sampledAt,
+                                               visibleSnapshot: visible)
+        }
+    }
+
     func prewarmPrimaryVideoIndex() async {
         guard let firstVideo = videoInfo.first else { return }
         _ = await segmentInfoCache.sidx(from: firstVideo.info, preferredHost: preferredHost)
